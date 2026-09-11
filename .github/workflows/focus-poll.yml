@@ -71,6 +71,11 @@ jobs:
       - name: Publish leaderboard to the job summary
         run: python monitor.py --best >> "$GITHUB_STEP_SUMMARY" || true
 
+      # The dashboard reads this file from the monitor-state branch.
+      - name: Export dashboard data
+        if: ${{ !cancelled() }}
+        run: python monitor.py --export dashboard.json || echo "::warning::dashboard export failed"
+
       # Saves even when the poll step failed partway, so alerts that already
       # went out are recorded and not re-sent next run. Skipped only if the
       # restore failed, because then there is nothing trustworthy to save.
@@ -86,6 +91,7 @@ jobs:
           git checkout --orphan tmp-state
           git rm -rf --cached . >/dev/null 2>&1 || true
           git add -f award_monitor.sqlite3
+          [ -f dashboard.json ] && git add -f dashboard.json || true
           git commit -m "state $(date -u +%FT%TZ)" >/dev/null
           git push -f origin tmp-state:monitor-state
 

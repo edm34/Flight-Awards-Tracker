@@ -1,9 +1,11 @@
-# JFK <-> SYD award monitor, open-date mode, four cabin views.
+# Open-date award monitor, several destinations, four cabin views.
 #
-# No fixed travel dates. The monitor scans the whole bookable calendar, ranks
-# every legal date combination by miles, and keeps one leaderboard per cabin.
-# Each cabin carries its own thresholds. A cabin with null floor and ceiling is
-# observe-only. It gets scanned, stored and ranked but never alerts.
+# No fixed travel dates. The monitor scans the whole bookable calendar for
+# every trip below, ranks every legal date combination by miles, and keeps
+# one leaderboard per trip and cabin. Prices live per trip, because Mexico
+# and Sydney are not on the same scale. A cabin with null floor and ceiling is
+# observe-only. It is scanned, stored, ranked and shown on the dashboard, but
+# never alerts.
 
 api:
   base_url: "https://seats.aero/partnerapi"
@@ -17,12 +19,12 @@ api:
   page_size: 500
 
 horizon:
-  # Delta loads schedule roughly 331 days out. Start far enough forward that
-  # award inventory exists. Adjust min_days_out down for a last-minute deal.
+  # Airlines load schedules roughly 331 days out. Start far enough forward
+  # that award inventory exists. Lower min_days_out for a last-minute deal.
   min_days_out: 45
   max_days_out: 331
-  # Each API call covers this many days. Smaller chunks mean more calls but
-  # less pagination per call. --budget shows the measured pagination.
+  # Each API call covers this many days for one trip. Smaller means more
+  # calls but less pagination per call. --budget shows the measured figure.
   chunk_days: 31
 
 scan:
@@ -30,103 +32,110 @@ scan:
   # scheduled  GitHub Actions runs --sweep and --once on the crons in
   #            .github/workflows and keeps the database on the monitor-state
   #            branch between runs
-  # --budget plans the day differently for each.
   mode: scheduled
   # Scheduled mode only. Mirror the crons in .github/workflows. focus-poll.yml
   # runs at :07 and :37, full-sweep.yml runs four times a day.
   polls_per_day: 48
   sweeps_per_day: 4
-  # Loop mode only. Full calendar sweep, both directions, every N hours.
+  # Focus windows go to every trip's economy top date first, then every
+  # trip's premium top, and so on, then fill by global rank. One per trip
+  # and month. Four trips need at least four windows.
+  max_focus_windows: 4
+  # Loop mode only.
   sweep_interval_hours: 6
-  # Loop mode only. Focused re-poll of each cabin's best months.
   focus_interval_minutes: 15
-  # Focus windows go to the top date of each cabin first (Y, W, J, F), then
-  # fill by global rank. Four cabins and three windows means the fourth cabin
-  # only gets a focus window when another cabin has nothing.
-  max_focus_windows: 3
 
-trip:
-  party_size: 4
-  outbound_origins: ["JFK", "EWR", "LGA", "BOS", "IAD", "PHL"]
-  outbound_destinations: ["SYD", "MEL", "BNE"]
+party_size: 4
 
-  # Mirrored automatically for the return direction.
-  min_trip_nights: 10
-  max_trip_nights: 35
+# Home airports. Every trip departs from one of these and returns to one.
+origins: [JFK, EWR, LGA, BOS, IAD, PHL]
+
+pairing:
+  # Both legs in one program, since splitting means holding two currencies.
   require_same_source: true
   allow_open_jaw: false
   # An outbound in business and a return in economy is not a business
-  # redemption. Leave false so every pairing is one cabin both ways. When true,
-  # a mixed pairing ranks under its lower cabin and --best adds a cabins column.
+  # redemption. When true, a mixed pairing ranks under its lower cabin.
   allow_mixed_cabin: false
 
-# One block per cabin. Every key is optional except sources.
+# Cabin defaults for every trip. No prices here, they are per trip below.
 #   label                   name used in headers and alert titles
-#   enabled                 false skips the cabin entirely
+#   enabled                 false skips the cabin everywhere
 #   sources                 programs worth querying for this cabin
-#   benchmark_miles         what you have actually paid, or null for a blank column
-#   floor_miles             at or under this always alerts
-#   ceiling_miles           above this never alerts
-#   new_best_margin_miles   also alert on a new cabin best that beats the old by this
+#   new_best_margin_miles   alert on a new best that beats the old by this
 #   max_total_taxes_usd     round trip tax cap per person, null for none
-#   min_seats               defaults to trip.party_size, only lower it deliberately
+#   min_seats               defaults to party_size, only lower it deliberately
 #   pushover_priority       -2 silent, -1 quiet, 0 normal, 1 bypasses quiet hours, 2 repeats until acknowledged
-# floor and ceiling are set together or left null together. Null means
-# observe-only. --calibrate proposes numbers once there is enough history.
+# seats.aero source ids. Virgin Australia's program is Velocity, so both
+# spellings are listed until the first sweep says which one returns rows.
 cabins:
   Y:
     label: "Economy"
-    enabled: true
-    sources: [delta, virginatlantic, virginaustralia, qantas, alaska, american, united, aeroplan]
-    benchmark_miles: 66200        # verified, April 2026 receipt
-    floor_miles: 60000
-    ceiling_miles: 72000
+    sources: [delta, virginatlantic, virginaustralia, velocity, qantas, alaska, american, united, aeroplan, flyingblue]
     new_best_margin_miles: 3000
     max_total_taxes_usd: 400
     pushover_priority: 1
   W:
     label: "Premium Economy"
-    enabled: true
-    sources: [delta, virginatlantic, virginaustralia, qantas, alaska, american, united, aeroplan]
-    benchmark_miles: null         # no prior redemption
-    floor_miles: null             # observe-only until --calibrate has history
-    ceiling_miles: null
+    sources: [delta, virginatlantic, virginaustralia, velocity, qantas, alaska, american, united, aeroplan, flyingblue]
     new_best_margin_miles: 8000
     max_total_taxes_usd: 500
-    pushover_priority: 0
   J:
     label: "Business"
-    enabled: true
-    sources: [delta, virginatlantic, virginaustralia, qantas, alaska, american, united, aeroplan]
-    benchmark_miles: null
-    floor_miles: null
-    ceiling_miles: null
+    sources: [delta, virginatlantic, virginaustralia, velocity, qantas, alaska, american, united, aeroplan, flyingblue]
     new_best_margin_miles: 20000
     max_total_taxes_usd: 800
-    min_seats: 4
-    pushover_priority: 0
   F:
     label: "First"
-    enabled: true
-    # Delta sells no first class on this route. First here means partner metal,
-    # mostly Qantas, so the useful sources are narrower.
-    sources: [qantas, alaska, american]
-    benchmark_miles: null
-    floor_miles: null
-    ceiling_miles: null
+    # Partner metal only, so the useful sources are narrower.
+    sources: [qantas, alaska, american, flyingblue]
     new_best_margin_miles: 40000
     max_total_taxes_usd: 1200
     min_seats: 2                  # four first class seats together is a fantasy
-    pushover_priority: 0
 
-# Global alert plumbing. Price thresholds live under cabins.
+# One block per trip. Each trip may override any cabin default and is the
+# only place price thresholds live.
+#   benchmark_miles   what you have actually paid, or null for a blank column
+#   floor_miles       at or under this always alerts
+#   ceiling_miles     above this never alerts
+# floor and ceiling are set together or left null together. Null means
+# observe-only. --calibrate proposes numbers once there is enough history.
+trips:
+  australia:
+    label: "Australia"
+    destinations: [SYD, MEL, BNE]
+    min_trip_nights: 10
+    max_trip_nights: 35
+    cabins:
+      Y:
+        benchmark_miles: 66200    # verified, April 2026 receipt
+        floor_miles: 60000
+        ceiling_miles: 72000
+      # W, J and F observe-only until --calibrate has history.
+  mexico:
+    label: "Mexico"
+    destinations: [MEX, SJD, LAP]
+    min_trip_nights: 5
+    max_trip_nights: 14
+  europe:
+    label: "Europe"
+    destinations: [CDG, MXP, GVA]
+    min_trip_nights: 7
+    max_trip_nights: 21
+  asia:
+    label: "Asia"
+    destinations: [SIN, HKG]
+    min_trip_nights: 10
+    max_trip_nights: 28
+
+# Global alert plumbing. Price thresholds live under trips.
 alerting:
-  # Legs older than this are dropped before ranking for alerts. --best uses a
-  # window 24 times wider so the leaderboard survives a quiet day.
+  # Legs older than this are dropped before ranking for alerts. --best and
+  # the dashboard use a window 24 times wider so they survive a quiet day.
   max_data_age_hours: 12
-  # Some programs never publish seat counts and return zero. False alerts
-  # anyway and labels the row "?". Flip to true once you know which of the
-  # eight sources report honestly.
+  # Some programs never publish seat counts and return zero. False keeps
+  # those rows, marks them "?" everywhere and says "seats unconfirmed" in
+  # the alert title. True drops them from the leaderboards and the alerts.
   require_seat_count: false
   # The same pairing alerts again only if it improves by this much or the
   # cooldown expires.

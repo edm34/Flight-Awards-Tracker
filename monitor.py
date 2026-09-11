@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-JFK <-> SYD award monitor, open-date mode, four cabin views.
+Open-date award monitor, several destinations, four cabin views.
 
-No fixed travel dates. The monitor sweeps the entire bookable calendar,
-stores every observation as a tick, pairs every legal outbound/return
-combination, and ranks them by total miles per person. Each cabin gets its
-own leaderboard, its own thresholds and its own running best, so a cheap
-economy print never hides a business one.
+No fixed travel dates. The monitor sweeps the entire bookable calendar for
+every trip in the config, stores every observation as a tick, pairs every
+legal outbound/return combination, and ranks them by total miles per person.
+Each trip and cabin gets its own leaderboard, thresholds and running best, so
+a cheap economy print to Mexico never hides a business print to Sydney.
 
 Two scan modes share one API budget:
 
-  sweep  full calendar, both directions, every few hours
-  focus  only the months around the current best combinations, every 15 min
+  sweep  full calendar, every trip, both directions
+  focus  only the months around each trip's best combinations
 
 Usage:
     python monitor.py --self-test         offline test, no network, no key
@@ -19,9 +19,11 @@ Usage:
     python monitor.py --sweep             one full calendar sweep
     python monitor.py --once              one focus poll
     python monitor.py --loop              scheduler, alternates sweep and focus
-    python monitor.py --best              four leaderboards, one per cabin
-    python monitor.py --best --cabin J    one cabin, --limit N rows per section
+    python monitor.py --best              overview, then every trip and cabin
+    python monitor.py --best --trip asia --cabin J --limit 40
+    python monitor.py --overview          where to go right now, one table
     python monitor.py --calibrate         propose thresholds from stored history
+    python monitor.py --export FILE       write the dashboard data file
     python monitor.py --stats             observation history summary
     python monitor.py --budget            API call plan, theoretical and measured
     python monitor.py --test-alert        send one Pushover message
@@ -52,7 +54,7 @@ import yaml
 LOG = logging.getLogger("awardmon")
 
 # Canonical cabin order. Every per-cabin loop in this file walks this tuple so
-# the config file, the leaderboard and the alerts all agree on it.
+# the config file, the leaderboards, the alerts and the dashboard all agree.
 CABIN_ORDER = ("Y", "W", "J", "F")
 CABIN_NAMES = {"Y": "Economy", "W": "Premium Economy", "J": "Business", "F": "First"}
 
@@ -69,12 +71,22 @@ QUOTA_HEADER = "x-ratelimit-remaining"
 CALIBRATE_MIN_COMBOS = 200
 CALIBRATE_MIN_DAYS = 14
 
-# How deep into each cabin's ranked list evaluate() looks for alerts.
+# The overview compares today's best against the median of the last few
+# weeks of snapshots, once there are at least this many days of them.
+TYPICAL_WINDOW_DAYS = 21
+TYPICAL_MIN_DAYS = 14
+
+# How deep into each ranked list evaluate() looks for alerts.
 ALERT_SCAN_DEPTH = 20
 
 # Qualifying pairings beyond the cheapest are listed in the same message, one
 # line each, up to this many. Pushover caps a message at 1024 characters.
 DIGEST_ROWS = 6
+
+# Rows per trip and cabin written to the dashboard file.
+DASHBOARD_ROWS = 15
+DASHBOARD_HISTORY_DAYS = 45
+DASHBOARD_HISTORY_FULL_DAYS = 2
 
 FARE_BRAND_REMINDER = "Check fare brand before you commit. Main Basic is non-refundable after 24h."
 
@@ -110,6 +122,7 @@ class Leg:
 class RoundTrip:
     outbound: Leg
     inbound: Leg
+    trip: str = ""
 
     @property
     def total_miles(self) -> int:
@@ -127,6 +140,8 @@ class RoundTrip:
 
     @property
     def min_seats(self) -> int:
+        """Binding seat count across both legs. Zero means at least one
+        program published nothing, which is not the same as zero seats."""
         pair = (self.outbound.seats, self.inbound.seats)
         return 0 if 0 in pair else min(pair)
 
@@ -151,8 +166,9 @@ class RoundTrip:
         return f"{self.outbound.origin}-{self.outbound.destination}"
 
     def key(self) -> str:
-        """Dedupe key. Both fingerprints carry the cabin, so the same dates
-        in a different cabin are a different alert."""
+        """Dedupe key. Both fingerprints carry route and cabin, so the same
+        dates in a different cabin or to a different city are a different
+        alert."""
         raw = f"{self.outbound.fingerprint()}|{self.inbound.fingerprint()}"
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
@@ -161,23 +177,32 @@ def _cabin_rank(code: str) -> int:
     return CABIN_ORDER.index(code) if code in CABIN_ORDER else len(CABIN_ORDER)
 
 
+def seat_status(rt: RoundTrip, min_seats: int) -> tuple[str, str]:
+    """(status, note). confirmed means both programs published a count of
+    at least min_seats. unpublished means at least one leg's program prints
+    no count at all, which is a maybe, not a yes. short means a published
+    count below what the party needs."""
+    seats = rt.min_seats
+    if seats == 0:
+        return "unpublished", "seats unpublished, verify before booking"
+    if seats < min_seats:
+        return "short", f"only {seats} seats"
+    return "confirmed", f"{seats} seats confirmed"
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-# Keys from the single-threshold config and where each one moved.
-LEGACY_KEYS = {
-    ("trip", "cabins"): "a cabins map with one block per cabin",
-    ("trip", "sources"): "cabins.<code>.sources",
-    ("alerting", "benchmark_miles"): "cabins.<code>.benchmark_miles",
-    ("alerting", "floor_miles"): "cabins.<code>.floor_miles",
-    ("alerting", "ceiling_miles"): "cabins.<code>.ceiling_miles",
-    ("alerting", "new_best_margin_miles"): "cabins.<code>.new_best_margin_miles",
-    ("alerting", "max_total_taxes_usd"): "cabins.<code>.max_total_taxes_usd",
-    ("pushover", "priority"): "cabins.<code>.pushover_priority",
-}
+REQUIRED_SECTIONS = ("api", "horizon", "scan", "origins", "trips", "cabins",
+                     "alerting", "pushover", "storage")
 
-REQUIRED_SECTIONS = ("api", "horizon", "scan", "trip", "cabins", "alerting", "pushover", "storage")
+# Keys a cabin block may carry at the top level (defaults for every trip) and
+# the price keys that only make sense per trip, since Mexico and Sydney are
+# not priced on the same scale.
+CABIN_DEFAULT_KEYS = ("label", "enabled", "sources", "min_seats", "max_total_taxes_usd",
+                      "pushover_priority", "new_best_margin_miles")
+CABIN_PRICE_KEYS = ("benchmark_miles", "floor_miles", "ceiling_miles")
 
 
 def load_config(path: str) -> dict:
@@ -193,71 +218,116 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
         raise SystemExit(f"{source}: {msg}")
 
     cfg = copy.deepcopy(raw or {})
+    if "trip" in cfg:
+        fail("this config predates trips. The trip section became party_size, "
+             "origins, pairing and a trips map. See README.md, Trips.")
     missing = [s for s in REQUIRED_SECTIONS if s not in cfg or cfg[s] is None]
     if missing:
         fail(f"missing section(s) {', '.join(missing)}")
 
-    legacy = [f"{a}.{b} moved to {where}" for (a, b), where in LEGACY_KEYS.items()
-              if isinstance(cfg.get(a), dict) and b in cfg[a]]
-    if legacy:
-        fail("this config predates per-cabin thresholds.\n  " + "\n  ".join(legacy))
-
-    trip = cfg["trip"]
-    party = trip.get("party_size")
+    party = cfg.get("party_size")
     if not isinstance(party, int) or party < 1:
-        fail("trip.party_size must be a positive integer")
-    trip.setdefault("allow_mixed_cabin", False)
-    trip.setdefault("require_same_source", True)
-    trip.setdefault("allow_open_jaw", False)
-    for key in ("outbound_origins", "outbound_destinations"):
-        if not trip.get(key):
-            fail(f"trip.{key} must list at least one airport")
-        trip[key] = [str(a).upper() for a in trip[key]]
-    if trip["min_trip_nights"] > trip["max_trip_nights"]:
-        fail("trip.min_trip_nights is above trip.max_trip_nights")
+        fail("party_size must be a positive integer")
+    origins = cfg["origins"]
+    if not origins:
+        fail("origins must list at least one airport")
+    cfg["origins"] = [str(a).upper() for a in origins]
 
+    pairing = cfg.setdefault("pairing", {}) or {}
+    pairing.setdefault("require_same_source", True)
+    pairing.setdefault("allow_open_jaw", False)
+    pairing.setdefault("allow_mixed_cabin", False)
+    cfg["pairing"] = pairing
+
+    # Cabin defaults. No prices here, those are per trip.
     cabins_raw = cfg["cabins"]
     if not isinstance(cabins_raw, dict) or not cabins_raw:
         fail("cabins must be a map keyed by cabin code (Y, W, J, F)")
     unknown = [c for c in cabins_raw if c not in CABIN_ORDER]
     if unknown:
         fail(f"unknown cabin code(s) {', '.join(map(str, unknown))}. Use Y, W, J or F.")
+    for code, block in cabins_raw.items():
+        block = block or {}
+        priced = [k for k in CABIN_PRICE_KEYS if block.get(k) is not None]
+        if priced:
+            fail(f"cabins.{code} carries {', '.join(priced)}. Prices live per trip, "
+                 f"under trips.<key>.cabins.{code}, because destinations are not "
+                 "priced on the same scale.")
+        cabins_raw[code] = block
 
-    cabins: dict[str, dict] = {}
-    for code in CABIN_ORDER:
-        if code not in cabins_raw:
-            continue
-        c = dict(cabins_raw[code] or {})
-        c["code"] = code
-        c.setdefault("label", CABIN_NAMES[code])
-        c.setdefault("enabled", True)
-        c.setdefault("min_seats", party)
-        c.setdefault("benchmark_miles", None)
-        c.setdefault("floor_miles", None)
-        c.setdefault("ceiling_miles", None)
-        c.setdefault("max_total_taxes_usd", None)
-        # An explicit null on these means the default, not a crash later.
-        c["new_best_margin_miles"] = c.get("new_best_margin_miles") or 0
-        c["pushover_priority"] = c.get("pushover_priority") or 0
-        if not c.get("sources"):
-            fail(f"cabins.{code}.sources must list at least one program")
-        c["sources"] = [str(s).lower() for s in c["sources"]]
-        floor, ceiling = c["floor_miles"], c["ceiling_miles"]
-        if (floor is None) != (ceiling is None):
-            fail(f"cabins.{code}: set both floor_miles and ceiling_miles, "
-                 "or leave both null for observe-only")
-        if floor is not None and floor > ceiling:
-            fail(f"cabins.{code}: floor_miles {floor:,} is above ceiling_miles {ceiling:,}")
-        if not isinstance(c["min_seats"], int) or c["min_seats"] < 1:
-            fail(f"cabins.{code}.min_seats must be a positive integer")
-        if c["min_seats"] > party:
-            fail(f"cabins.{code}.min_seats {c['min_seats']} is above party_size {party}")
-        if not -2 <= int(c["pushover_priority"]) <= 2:
-            fail(f"cabins.{code}.pushover_priority must be between -2 and 2")
-        cabins[code] = c
-    cfg["cabins"] = cabins
-    if not any(c["enabled"] for c in cabins.values()):
-        fail("every cabin is disabled, nothing to scan")
+    trips_raw = cfg["trips"]
+    if not isinstance(trips_raw, dict) or not trips_raw:
+        fail("trips must be a map with at least one trip")
+    trips: dict[str, dict] = {}
+    seen_dest: dict[str, str] = {}
+    for key, t in trips_raw.items():
+        t = dict(t or {})
+        t["key"] = str(key)
+        t.setdefault("label", str(key).title())
+        t.setdefault("enabled", True)
+        dests = t.get("destinations")
+        if not dests:
+            fail(f"trips.{key}.destinations must list at least one airport")
+        t["destinations"] = [str(a).upper() for a in dests]
+        for d in t["destinations"]:
+            if d in cfg["origins"]:
+                fail(f"trips.{key}: {d} is also an origin")
+            if d in seen_dest:
+                fail(f"trips.{key}: {d} already belongs to trips.{seen_dest[d]}")
+            seen_dest[d] = str(key)
+        for k in ("min_trip_nights", "max_trip_nights"):
+            if not isinstance(t.get(k), int) or t[k] < 1:
+                fail(f"trips.{key}.{k} must be a positive integer")
+        if t["min_trip_nights"] > t["max_trip_nights"]:
+            fail(f"trips.{key}: min_trip_nights is above max_trip_nights")
+
+        overrides = t.get("cabins") or {}
+        bad = [c for c in overrides if c not in CABIN_ORDER]
+        if bad:
+            fail(f"trips.{key}.cabins has unknown cabin code(s) {', '.join(map(str, bad))}")
+        resolved: dict[str, dict] = {}
+        for code in CABIN_ORDER:
+            if code not in cabins_raw and code not in overrides:
+                continue
+            c = dict(cabins_raw.get(code) or {})
+            c.update(overrides.get(code) or {})
+            c["code"] = code
+            c.setdefault("label", CABIN_NAMES[code])
+            c.setdefault("enabled", True)
+            c.setdefault("min_seats", party)
+            c.setdefault("max_total_taxes_usd", None)
+            for k in CABIN_PRICE_KEYS:
+                c.setdefault(k, None)
+            # An explicit null on these means the default, not a crash later.
+            c["new_best_margin_miles"] = c.get("new_best_margin_miles") or 0
+            c["pushover_priority"] = c.get("pushover_priority") or 0
+            if not c.get("sources"):
+                fail(f"trips.{key}.cabins.{code} has no sources. Set them on cabins.{code} "
+                     "or on the trip.")
+            c["sources"] = [str(s).lower() for s in c["sources"]]
+            floor, ceiling = c["floor_miles"], c["ceiling_miles"]
+            if (floor is None) != (ceiling is None):
+                fail(f"trips.{key}.cabins.{code}: set both floor_miles and ceiling_miles, "
+                     "or leave both null for observe-only")
+            if floor is not None and floor > ceiling:
+                fail(f"trips.{key}.cabins.{code}: floor_miles {floor:,} is above "
+                     f"ceiling_miles {ceiling:,}")
+            if not isinstance(c["min_seats"], int) or c["min_seats"] < 1:
+                fail(f"trips.{key}.cabins.{code}.min_seats must be a positive integer")
+            if c["min_seats"] > party:
+                fail(f"trips.{key}.cabins.{code}.min_seats {c['min_seats']} is above "
+                     f"party_size {party}")
+            if not -2 <= int(c["pushover_priority"]) <= 2:
+                fail(f"trips.{key}.cabins.{code}.pushover_priority must be between -2 and 2")
+            resolved[code] = c
+        if not any(c["enabled"] for c in resolved.values()):
+            fail(f"trips.{key}: every cabin is disabled")
+        t["cabins"] = resolved
+        trips[str(key)] = t
+    if not any(t["enabled"] for t in trips.values()):
+        fail("every trip is disabled, nothing to scan")
+    cfg["trips"] = trips
+    cfg["dest_to_trip"] = seen_dest
 
     alerting = cfg["alerting"]
     alerting.setdefault("max_data_age_hours", 12)
@@ -271,6 +341,7 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
         fail(f"scan.mode must be loop or scheduled, not {scan['mode']!r}")
     scan.setdefault("sweeps_per_day", 4)
     scan.setdefault("polls_per_day", 48)
+    scan.setdefault("max_focus_windows", 4)
 
     api = cfg["api"]
     api.setdefault("budget_safety_margin", 0)
@@ -282,13 +353,17 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
     return cfg
 
 
-def enabled_cabins(cfg: dict) -> list[dict]:
-    return [c for c in cfg["cabins"].values() if c["enabled"]]
+def enabled_trips(cfg: dict) -> list[dict]:
+    return [t for t in cfg["trips"].values() if t["enabled"]]
 
 
-def query_plan(cfg: dict) -> tuple[list[str], list[str]]:
+def enabled_cabins(trip: dict) -> list[dict]:
+    return [c for c in trip["cabins"].values() if c["enabled"]]
+
+
+def query_plan(trip: dict) -> tuple[list[str], list[str]]:
     """Cabin codes and the union of their sources for one API call."""
-    cabins = enabled_cabins(cfg)
+    cabins = enabled_cabins(trip)
     codes = [c["code"] for c in cabins]
     sources: list[str] = []
     for c in cabins:
@@ -342,6 +417,17 @@ CREATE TABLE IF NOT EXISTS state (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    trip TEXT NOT NULL,
+    cabin TEXT NOT NULL,
+    best_miles INTEGER,
+    viable INTEGER NOT NULL,
+    unconfirmed INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snap ON snapshots(trip, cabin, at);
 """
 
 
@@ -435,6 +521,33 @@ class Store:
         ).fetchall()
         return {r["cabin"]: (r["first"], r["last"], r["n"]) for r in rows}
 
+    # -- snapshots --------------------------------------------------------
+    def record_snapshot(self, at: str, trip: str, cabin: str, best: int | None,
+                        viable: int, unconfirmed: int) -> None:
+        self.conn.execute(
+            "INSERT INTO snapshots(at, trip, cabin, best_miles, viable, unconfirmed) "
+            "VALUES (?,?,?,?,?,?)", (at, trip, cabin, best, viable, unconfirmed))
+        self.conn.commit()
+
+    def snapshot_history(self, trip: str, cabin: str, days: int) -> list[sqlite3.Row]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        return self.conn.execute(
+            """SELECT at, best_miles, viable, unconfirmed FROM snapshots
+               WHERE trip = ? AND cabin = ? AND at >= ? ORDER BY at""",
+            (trip, cabin, cutoff)).fetchall()
+
+    def typical_best(self, trip: str, cabin: str) -> float | None:
+        """Median best over the last TYPICAL_WINDOW_DAYS of snapshots, only
+        when the snapshots span at least TYPICAL_MIN_DAYS."""
+        rows = [r for r in self.snapshot_history(trip, cabin, TYPICAL_WINDOW_DAYS)
+                if r["best_miles"] is not None]
+        if len(rows) < 2:
+            return None
+        span = (datetime.fromisoformat(rows[-1]["at"]) - datetime.fromisoformat(rows[0]["at"]))
+        if span.total_seconds() / 86400 < TYPICAL_MIN_DAYS:
+            return None
+        return percentile([r["best_miles"] for r in rows], 50)
+
     # -- api usage --------------------------------------------------------
     def count_api_call(self, quota_remaining: int | None) -> int:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -472,13 +585,14 @@ class Store:
                  last_alerted_at = excluded.last_alerted_at,
                  payload = excluded.payload""",
             (rt.key(), rt.total_miles, datetime.now(timezone.utc).isoformat(),
-             json.dumps({"out": asdict(rt.outbound), "in": asdict(rt.inbound)})),
+             json.dumps({"out": asdict(rt.outbound), "in": asdict(rt.inbound), "trip": rt.trip})),
         )
         self.conn.commit()
 
     def prune(self, days: int) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         cur = self.conn.execute("DELETE FROM observations WHERE observed_at < ?", (cutoff,))
+        self.conn.execute("DELETE FROM snapshots WHERE at < ?", (cutoff,))
         self.conn.commit()
         return cur.rowcount
 
@@ -535,7 +649,7 @@ class SeatsAero:
         self.session.headers.update({
             "Partner-Authorization": key,
             "Accept": "application/json",
-            "User-Agent": "personal-award-monitor/3.0",
+            "User-Agent": "personal-award-monitor/4.0",
         })
 
     def budget_left(self) -> int:
@@ -694,11 +808,11 @@ def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
 # ---------------------------------------------------------------------------
 
 
-def build_round_trips(legs: list[Leg], trip: dict) -> list[RoundTrip]:
-    """Pair every outbound leg with every legal return leg."""
-    out_origins = set(trip["outbound_origins"])
-    out_dests = set(trip["outbound_destinations"])
-
+def build_round_trips(legs: list[Leg], origins: list[str], destinations: list[str],
+                      min_nights: int, max_nights: int, pairing: dict,
+                      trip_key: str = "") -> list[RoundTrip]:
+    """Pair every outbound leg with every legal return leg for one trip."""
+    out_origins, out_dests = set(origins), set(destinations)
     outbound = [l for l in legs if l.origin in out_origins and l.destination in out_dests]
     inbound = [l for l in legs if l.origin in out_dests and l.destination in out_origins]
 
@@ -707,10 +821,9 @@ def build_round_trips(legs: list[Leg], trip: dict) -> list[RoundTrip]:
     for leg in inbound:
         by_origin.setdefault(leg.origin, []).append(leg)
 
-    min_n, max_n = trip["min_trip_nights"], trip["max_trip_nights"]
-    same_source = trip["require_same_source"]
-    open_jaw = trip["allow_open_jaw"]
-    mixed_ok = trip.get("allow_mixed_cabin", False)
+    same_source = pairing["require_same_source"]
+    open_jaw = pairing["allow_open_jaw"]
+    mixed_ok = pairing["allow_mixed_cabin"]
 
     pairs: list[RoundTrip] = []
     for out in outbound:
@@ -720,26 +833,28 @@ def build_round_trips(legs: list[Leg], trip: dict) -> list[RoundTrip]:
                 continue
             if not mixed_ok and out.cabin != back.cabin:
                 continue
-            rt = RoundTrip(out, back)
-            if not (min_n <= rt.nights <= max_n):
+            rt = RoundTrip(out, back, trip_key)
+            if not (min_nights <= rt.nights <= max_nights):
                 continue
             pairs.append(rt)
     return pairs
 
 
 def viable(rt: RoundTrip, cabin_cfg: dict, alert_cfg: dict) -> tuple[bool, str]:
-    """Seat and tax feasibility for one cabin. Price is judged separately."""
+    """Seat and tax feasibility for one cabin. Price is judged separately.
+    An unpublished seat count passes unless require_seat_count is set, and
+    the note says so, because a maybe must never read as a yes."""
     cap = cabin_cfg.get("max_total_taxes_usd")
     if cap is not None and rt.total_taxes > cap:
         return False, "taxes too high"
-    seats = rt.min_seats
-    if seats == 0:
+    status, note = seat_status(rt, cabin_cfg["min_seats"])
+    if status == "unpublished":
         if alert_cfg["require_seat_count"]:
             return False, "seat count not published"
-        return True, "seats unpublished, verify"
-    if seats < cabin_cfg["min_seats"]:
-        return False, f"only {seats} seats"
-    return True, f"{seats} seats confirmed"
+        return True, note
+    if status == "short":
+        return False, note
+    return True, note
 
 
 def alert_reason(rt: RoundTrip, prev_best: int | None, cabin_cfg: dict) -> str | None:
@@ -777,44 +892,58 @@ def should_alert(rt: RoundTrip, store: Store, alert_cfg: dict) -> bool:
     return False
 
 
-def rank_by_cabin(cfg: dict, legs: list[Leg]) -> dict[str, list[tuple[RoundTrip, str]]]:
-    """Every enabled cabin, ascending by total miles, viable pairings only.
-    A cabin's list only holds pairings from that cabin's own sources."""
-    trip, alert_cfg = cfg["trip"], cfg["alerting"]
-    pairs = build_round_trips(legs, trip)
-    ranked: dict[str, list[tuple[RoundTrip, str]]] = {c["code"]: [] for c in enabled_cabins(cfg)}
-    for rt in pairs:
-        ccfg = cfg["cabins"].get(rt.cabin)
-        if ccfg is None or not ccfg["enabled"]:
-            continue
-        if rt.outbound.source not in ccfg["sources"] or rt.inbound.source not in ccfg["sources"]:
-            continue
-        ok, note = viable(rt, ccfg, alert_cfg)
-        if ok:
-            ranked[rt.cabin].append((rt, note))
-    for rows in ranked.values():
-        rows.sort(key=lambda x: (x[0].total_miles, x[0].outbound.depart_date))
+Ranked = dict[str, dict[str, list[tuple[RoundTrip, str]]]]
+
+
+def rank_all(cfg: dict, legs: list[Leg]) -> Ranked:
+    """Every enabled trip and cabin, ascending by total miles, viable pairings
+    only. A cabin's list only holds pairings from that cabin's own sources.
+    This is the one place pairings become ranked lists, so alerts, the
+    leaderboards, calibration and the dashboard can't drift apart."""
+    alert_cfg, pairing = cfg["alerting"], cfg["pairing"]
+    ranked: Ranked = {}
+    for trip in enabled_trips(cfg):
+        key = trip["key"]
+        ranked[key] = {c["code"]: [] for c in enabled_cabins(trip)}
+        pairs = build_round_trips(legs, cfg["origins"], trip["destinations"],
+                                  trip["min_trip_nights"], trip["max_trip_nights"],
+                                  pairing, key)
+        for rt in pairs:
+            ccfg = trip["cabins"].get(rt.cabin)
+            if ccfg is None or not ccfg["enabled"]:
+                continue
+            if rt.outbound.source not in ccfg["sources"] or rt.inbound.source not in ccfg["sources"]:
+                continue
+            ok, note = viable(rt, ccfg, alert_cfg)
+            if ok:
+                ranked[key][rt.cabin].append((rt, note))
+        for rows in ranked[key].values():
+            rows.sort(key=lambda x: (x[0].total_miles, x[0].outbound.depart_date))
     return ranked
 
 
-def choose_focus_dates(ranked: dict[str, list[tuple[RoundTrip, str]]], cap: int) -> list[str]:
-    """Top date from each cabin first, then fill by global rank, one per month."""
-    focus: list[str] = []
-    months: set[str] = set()
+def choose_focus_windows(ranked: Ranked, cap: int) -> list[dict]:
+    """Where to re-poll between sweeps. Every trip's economy top first, then
+    every trip's premium top, and so on, so a later trip is never starved by
+    an earlier one's four cabins. Then fill by global rank. One window per
+    trip and month, capped."""
+    focus: list[dict] = []
+    seen: set[tuple[str, str]] = set()
 
     def take(rt: RoundTrip) -> None:
-        month = rt.outbound.depart_date[:7]
-        if month in months or len(focus) >= cap:
+        month = (rt.trip, rt.outbound.depart_date[:7])
+        if month in seen or len(focus) >= cap:
             return
-        months.add(month)
-        focus.append(rt.outbound.depart_date)
+        seen.add(month)
+        focus.append({"trip": rt.trip, "date": rt.outbound.depart_date})
 
     for code in CABIN_ORDER:
-        rows = ranked.get(code)
-        if rows:
-            take(rows[0][0])
-    everything = sorted((rt for rows in ranked.values() for rt, _ in rows),
-                        key=lambda rt: rt.total_miles)
+        for cabins in ranked.values():
+            rows = cabins.get(code)
+            if rows:
+                take(rows[0][0])
+    everything = sorted((rt for cabins in ranked.values() for rows in cabins.values()
+                         for rt, _ in rows), key=lambda rt: rt.total_miles)
     for rt in everything:
         if len(focus) >= cap:
             break
@@ -827,12 +956,16 @@ def choose_focus_dates(ranked: dict[str, list[tuple[RoundTrip, str]]], cap: int)
 # ---------------------------------------------------------------------------
 
 
-def format_alert(rt: RoundTrip, seat_note: str, reason: str,
-                 party: int, cabin_cfg: dict) -> tuple[str, str]:
+def format_alert(rt: RoundTrip, seat_note: str, reason: str, party: int,
+                 trip: dict, cabin_cfg: dict) -> tuple[str, str]:
     label = cabin_cfg["label"].upper()
     if rt.mixed:
         label += f" ({rt.cabin_code} mixed)"
-    title = f"{rt.total_miles // 1000}k {label} {rt.outbound.source.upper()} {rt.route}"
+    title = (f"{rt.total_miles // 1000}k {trip['label'].upper()} {label} "
+             f"{rt.outbound.source.upper()} {rt.route}")
+    status, _ = seat_status(rt, cabin_cfg["min_seats"])
+    if status != "confirmed":
+        title += ", seats unconfirmed"
     lines = [
         f"Out  {rt.outbound.depart_date}  {rt.outbound.origin}-{rt.outbound.destination}  "
         f"{rt.outbound.miles:,} mi{'  nonstop' if rt.outbound.direct else ''}",
@@ -843,6 +976,9 @@ def format_alert(rt: RoundTrip, seat_note: str, reason: str,
         f"x{party} = {rt.total_miles * party:,} miles for the party",
         f"{rt.nights} nights, {seat_note}",
     ]
+    if status != "confirmed":
+        lines.append(f"{cabin_cfg['min_seats']} seats together are NOT confirmed. "
+                     "The program publishes no count, check before you count on it.")
     bench = cabin_cfg.get("benchmark_miles")
     if bench:
         gap = bench - rt.total_miles
@@ -853,25 +989,25 @@ def format_alert(rt: RoundTrip, seat_note: str, reason: str,
 
 
 def format_digest(hits: list[tuple[RoundTrip, str, str]], party: int,
-                  cabin_cfg: dict) -> tuple[str, str]:
-    """One message per cabin per pass. The cheapest qualifying pairing in
-    full, then the other qualifying dates one line each. Twenty return dates
-    at one price are one message, not twenty. The first live sweep sent
-    twenty and that is why this exists."""
+                  trip: dict, cabin_cfg: dict) -> tuple[str, str]:
+    """One message per trip and cabin per pass. The cheapest qualifying
+    pairing in full, then the other qualifying dates one line each. Twenty
+    return dates at one price are one message, not twenty. The first live
+    sweep sent twenty and that is why this exists."""
     rt, note, reason = hits[0]
-    title, body = format_alert(rt, note, reason, party, cabin_cfg)
+    title, body = format_alert(rt, note, reason, party, trip, cabin_cfg)
     if len(hits) == 1:
         return title, body
     title += f" +{len(hits) - 1} more"
     lines = body.split("\n")
     extra = ["Also qualifying, per person"]
     for other, _, _ in hits[1:DIGEST_ROWS + 1]:
-        seats = f"  {other.min_seats} seats" if other.min_seats else ""
+        seats = f"  {other.min_seats} seats" if other.min_seats else "  seats ?"
         extra.append(f"{other.outbound.depart_date} > {other.inbound.depart_date}  "
                      f"{other.outbound.source} {other.route}  {other.total_miles:,}{seats}")
     rest = len(hits) - 1 - DIGEST_ROWS
     if rest > 0:
-        extra.append(f"and {rest} more, run --best --cabin {cabin_cfg['code']}")
+        extra.append(f"and {rest} more, run --best --trip {trip['key']} --cabin {cabin_cfg['code']}")
     # body ends with a blank line and the fare brand reminder. Keep them last.
     return title, "\n".join(lines[:-2] + extra + lines[-2:])
 
@@ -904,17 +1040,14 @@ def send_pushover(cfg: dict, title: str, message: str, priority: int = 0) -> boo
 # ---------------------------------------------------------------------------
 
 
-def fetch_window(client: SeatsAero, store: Store, cfg: dict,
+def fetch_window(client: SeatsAero, store: Store, cfg: dict, trip: dict,
                  start: str, end: str) -> tuple[int, int, bool]:
-    """Both directions for one date window. Returns legs stored, API calls
-    used and whether either direction hit the page cap."""
-    trip = cfg["trip"]
-    codes, sources = query_plan(cfg)
+    """Both directions for one trip and one date window. Returns legs stored,
+    API calls used and whether either direction hit the page cap."""
+    codes, sources = query_plan(trip)
     legs_total, calls, capped = 0, 0, False
-    for origins, dests in (
-        (trip["outbound_origins"], trip["outbound_destinations"]),
-        (trip["outbound_destinations"], trip["outbound_origins"]),
-    ):
+    for origins, dests in ((cfg["origins"], trip["destinations"]),
+                           (trip["destinations"], cfg["origins"])):
         res = client.cached_search(origins, dests, codes, sources, start, end)
         legs = [leg for obj in res.rows for leg in parse_availability(obj, codes)]
         store.record_legs(legs)
@@ -924,59 +1057,65 @@ def fetch_window(client: SeatsAero, store: Store, cfg: dict,
     return legs_total, calls, capped
 
 
-def evaluate(cfg: dict, store: Store, dry_run: bool) -> dict[str, list[RoundTrip]]:
-    """Rank everything currently known, per cabin, and alert on what qualifies."""
-    trip, alert_cfg = cfg["trip"], cfg["alerting"]
-    party = trip["party_size"]
-
+def evaluate(cfg: dict, store: Store, dry_run: bool) -> Ranked:
+    """Rank everything currently known, per trip and cabin, alert on what
+    qualifies, record a snapshot of every list for the price history."""
+    alert_cfg, party = cfg["alerting"], cfg["party_size"]
     legs = store.latest_legs(alert_cfg["max_data_age_hours"])
-    ranked = rank_by_cabin(cfg, legs)
-    LOG.info("%d fresh legs, viable pairings per cabin: %s", len(legs),
-             ", ".join(f"{code} {len(rows)}" for code, rows in ranked.items()))
+    ranked = rank_all(cfg, legs)
+    now = datetime.now(timezone.utc).isoformat()
+    LOG.info("%d fresh legs, viable pairings: %s", len(legs), ", ".join(
+        f"{t} " + "/".join(f"{c}{len(r)}" for c, r in cabins.items())
+        for t, cabins in ranked.items()))
 
-    for code, rows in ranked.items():
-        if not rows:
-            continue
-        ccfg = cfg["cabins"][code]
-        state_key = f"best_total_miles:{code}"
-        prev_best = store.get_state(state_key)
-        best_rt = rows[0][0]
-
-        # rows is ascending, so walk it with a running best. Without this every
-        # combination compares against the same stale figure and a cold start
-        # alerts on the whole leaderboard instead of just the winner. The best
-        # is per cabin so a cheap economy pairing never suppresses business.
-        running_best = prev_best
-        hits: list[tuple[RoundTrip, str, str]] = []
-        for rt, note in rows[:ALERT_SCAN_DEPTH]:
-            reason = alert_reason(rt, running_best, ccfg)
-            if not reason or not should_alert(rt, store, alert_cfg):
+    for trip_key, cabins in ranked.items():
+        trip = cfg["trips"][trip_key]
+        for code, rows in cabins.items():
+            ccfg = trip["cabins"][code]
+            unconfirmed = sum(1 for rt, _ in rows if seat_status(rt, ccfg["min_seats"])[0] != "confirmed")
+            store.record_snapshot(now, trip_key, code, rows[0][0].total_miles if rows else None,
+                                  len(rows), unconfirmed)
+            if not rows:
                 continue
-            hits.append((rt, note, reason))
-            running_best = min(running_best or rt.total_miles, rt.total_miles)
+            state_key = f"best_total_miles:{trip_key}:{code}"
+            prev_best = store.get_state(state_key)
+            best_rt = rows[0][0]
 
-        # Everything that qualified goes out as one message for this cabin.
-        if hits:
-            title, message = format_digest(hits, party, ccfg)
-            if dry_run:
-                print(f"\n--- WOULD ALERT (priority {ccfg['pushover_priority']}) ---\n{title}\n{message}")
-                sent = True
-            else:
-                sent = send_pushover(cfg["pushover"], title, message, ccfg["pushover_priority"])
+            # rows is ascending, so walk it with a running best. Without this
+            # every combination compares against the same stale figure and a
+            # cold start alerts on the whole leaderboard instead of just the
+            # winner. The best is per trip and cabin so a cheap economy pairing
+            # never suppresses business, and Mexico never suppresses Sydney.
+            running_best = prev_best
+            hits: list[tuple[RoundTrip, str, str]] = []
+            for rt, note in rows[:ALERT_SCAN_DEPTH]:
+                reason = alert_reason(rt, running_best, ccfg)
+                if not reason or not should_alert(rt, store, alert_cfg):
+                    continue
+                hits.append((rt, note, reason))
+                running_best = min(running_best or rt.total_miles, rt.total_miles)
+
+            # Everything that qualified goes out as one message.
+            if hits:
+                title, message = format_digest(hits, party, trip, ccfg)
+                if dry_run:
+                    print(f"\n--- WOULD ALERT (priority {ccfg['pushover_priority']}) ---\n{title}\n{message}")
+                    sent = True
+                else:
+                    sent = send_pushover(cfg["pushover"], title, message, ccfg["pushover_priority"])
+                    if sent:
+                        LOG.info("Alerted: %s, %d pairing(s)", title, len(hits))
                 if sent:
-                    LOG.info("Alerted: %s, %d pairing(s)", title, len(hits))
-            if sent:
-                for rt, _, _ in hits:
-                    store.save_alert(rt)
+                    for rt, _, _ in hits:
+                        store.save_alert(rt)
 
-        if prev_best is None or best_rt.total_miles < prev_best:
-            store.set_state(state_key, best_rt.total_miles)
+            if prev_best is None or best_rt.total_miles < prev_best:
+                store.set_state(state_key, best_rt.total_miles)
 
-    focus = choose_focus_dates(ranked, cfg["scan"]["max_focus_windows"])
+    focus = choose_focus_windows(ranked, cfg["scan"]["max_focus_windows"])
     if focus:
-        store.set_state("focus_dates", focus)
-
-    return {code: [rt for rt, _ in rows] for code, rows in ranked.items()}
+        store.set_state("focus_windows", focus)
+    return ranked
 
 
 def prune_history(cfg: dict, store: Store) -> int:
@@ -992,20 +1131,21 @@ def prune_history(cfg: dict, store: Store) -> int:
 
 def run_sweep(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None:
     chunks = horizon_chunks(cfg)
-    codes, sources = query_plan(cfg)
-    LOG.info("Sweep starting, %d windows, cabins %s, %d sources, %d calls left today",
-             len(chunks), "".join(codes), len(sources), client.budget_left())
+    trips = enabled_trips(cfg)
+    LOG.info("Sweep starting, %d windows x %d trips, %d calls left today",
+             len(chunks), len(trips), client.budget_left())
     windows_done, calls_total, capped_windows = 0, 0, 0
     for start, end in chunks:
-        if client.budget_left() < 4:
-            LOG.warning("Stopping sweep early to protect focus polling")
-            break
-        legs, calls, capped = fetch_window(client, store, cfg, start, end)
-        windows_done += 1
-        calls_total += calls
-        capped_windows += int(capped)
-        LOG.info("  %s to %s: %d legs, %d calls%s", start, end, legs, calls,
-                 ", PAGE CAP HIT" if capped else "")
+        for trip in trips:
+            if client.budget_left() < 4:
+                LOG.warning("Stopping sweep early to protect focus polling")
+                break
+            legs, calls, capped = fetch_window(client, store, cfg, trip, start, end)
+            windows_done += 1
+            calls_total += calls
+            capped_windows += int(capped)
+            LOG.info("  %s to %s %-10s %5d legs, %d calls%s", start, end, trip["key"],
+                     legs, calls, ", PAGE CAP HIT" if capped else "")
     if windows_done:
         store.set_state("sweep_stats", {
             "at": datetime.now(timezone.utc).isoformat(),
@@ -1020,18 +1160,19 @@ def run_sweep(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
 
 
 def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None:
-    focus_dates = store.get_state("focus_dates") or []
-    if not focus_dates:
+    windows = store.get_state("focus_windows") or []
+    windows = [w for w in windows if w.get("trip") in cfg["trips"] and cfg["trips"][w["trip"]]["enabled"]]
+    if not windows:
         LOG.info("No focus windows yet, running a sweep instead")
         run_sweep(cfg, store, client, dry_run)
         return
     calls_total = 0
-    for day in focus_dates:
-        start, end = month_window(day)
-        _, calls, _ = fetch_window(client, store, cfg, start, end)
+    for w in windows:
+        start, end = month_window(w["date"])
+        _, calls, _ = fetch_window(client, store, cfg, cfg["trips"][w["trip"]], start, end)
         calls_total += calls
     LOG.info("Focus poll of %d windows done in %d calls, %d calls left",
-             len(focus_dates), calls_total, client.budget_left())
+             len(windows), calls_total, client.budget_left())
     evaluate(cfg, store, dry_run)
     prune_history(cfg, store)
 
@@ -1039,12 +1180,12 @@ def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
 def run_probe(cfg: dict, client: SeatsAero) -> None:
     """One live call. Prints everything needed to reconcile the parser
     against the real API, then stops. Costs exactly one call."""
-    trip = cfg["trip"]
-    codes, sources = query_plan(cfg)
+    trip = enabled_trips(cfg)[0]
+    codes, sources = query_plan(trip)
     start, end = horizon_chunks(cfg)[0]
-    params = client.base_params(trip["outbound_origins"], trip["outbound_destinations"],
-                                codes, sources, start, end, take=25)
-    print(f"\nPROBE  one cached search call")
+    params = client.base_params(cfg["origins"], trip["destinations"], codes, sources,
+                                start, end, take=25)
+    print(f"\nPROBE  one cached search call, trip {trip['key']}")
     for k, v in params.items():
         print(f"  {k:20} {v}")
 
@@ -1111,8 +1252,8 @@ def run_probe(cfg: dict, client: SeatsAero) -> None:
         print(f"  {leg.cabin} {leg.origin}-{leg.destination} {leg.depart_date} {leg.source:12} "
               f"{leg.miles:>8,} mi  taxes {leg.taxes_usd:,.2f} {leg.taxes_currency}  "
               f"seats {leg.seats}  direct {leg.direct}")
-    print("\nCompare one row against delta.com. If the taxes are off by 100x, "
-          "TotalTaxes is not in the minor unit.")
+    print("\nCompare one row against the program's own site. If the taxes are off "
+          "by 100x, TotalTaxes is not in the minor unit.")
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1262,11 @@ def run_probe(cfg: dict, client: SeatsAero) -> None:
 
 BEST_HEADER = (f"{'out':11} {'back':11} {'nts':>4} {'route':9} {'prog':14} "
                f"{'miles':>8} {'vs bench':>9} {'seats':>6} {'party':>10}")
+
+
+def seats_cell(rt: RoundTrip, min_seats: int) -> str:
+    status, _ = seat_status(rt, min_seats)
+    return str(rt.min_seats) if status == "confirmed" else "?"
 
 
 def cabin_headline(c: dict) -> tuple[str, str]:
@@ -1142,8 +1288,8 @@ def cabin_headline(c: dict) -> tuple[str, str]:
     return first, second
 
 
-def print_best_section(c: dict, rows: list[tuple[RoundTrip, str]], legs_seen: int,
-                       party: int, trip: dict, limit: int, show_cabins: bool) -> None:
+def print_best_section(trip: dict, c: dict, rows: list[tuple[RoundTrip, str]],
+                       legs_seen: int, party: int, limit: int, show_cabins: bool) -> None:
     first, second = cabin_headline(c)
     print(first)
     print(second)
@@ -1160,11 +1306,11 @@ def print_best_section(c: dict, rows: list[tuple[RoundTrip, str]], legs_seen: in
     print(BEST_HEADER + ("  cabins" if show_cabins else ""))
     print("-" * (len(BEST_HEADER) + (8 if show_cabins else 0)))
     for rt, _ in rows[:limit]:
-        seats = str(rt.min_seats or "?")
         vs = f"{bench - rt.total_miles:>+9,}" if bench else f"{'-':>9}"
         line = (f"{rt.outbound.depart_date:11} {rt.inbound.depart_date:11} "
                 f"{rt.nights:>4} {rt.route:9} {rt.outbound.source:14} "
-                f"{rt.total_miles:>8,} {vs} {seats:>6} {rt.total_miles * party:>10,}")
+                f"{rt.total_miles:>8,} {vs} {seats_cell(rt, c['min_seats']):>6} "
+                f"{rt.total_miles * party:>10,}")
         if show_cabins:
             line += f"  {rt.cabin_code}"
         print(line)
@@ -1173,41 +1319,124 @@ def print_best_section(c: dict, rows: list[tuple[RoundTrip, str]], legs_seen: in
     if bench:
         under = sum(1 for rt, _ in rows if rt.total_miles < bench)
         tail += f", {under:,} beat the benchmark"
+    unconfirmed = sum(1 for rt, _ in rows if seat_status(rt, c["min_seats"])[0] != "confirmed")
+    if unconfirmed:
+        tail += f", {unconfirmed:,} with no published seat count (shown as ?)"
     print(f"  {tail}")
     print()
 
 
-def show_best(cfg: dict, store: Store, limit: int = 15, cabin: str | None = None) -> None:
-    trip, alert_cfg = cfg["trip"], cfg["alerting"]
-    party = trip["party_size"]
+def overview_rows(cfg: dict, store: Store, ranked: Ranked) -> list[dict]:
+    """One row per enabled trip. Cheapest viable per cabin with seat status,
+    and the gap against the recent typical best when there is history."""
+    out = []
+    for trip in enabled_trips(cfg):
+        cabins = ranked.get(trip["key"], {})
+        row = {"key": trip["key"], "label": trip["label"],
+               "destinations": trip["destinations"], "cabins": {}}
+        for code, rows in cabins.items():
+            ccfg = trip["cabins"][code]
+            cell: dict[str, Any] = {"viable": len(rows), "best": None, "seats": None,
+                                    "status": None, "vs_typical": None, "vs_bench": None}
+            if rows:
+                rt = rows[0][0]
+                status, _ = seat_status(rt, ccfg["min_seats"])
+                cell.update({"best": rt.total_miles, "seats": rt.min_seats, "status": status})
+                typical = store.typical_best(trip["key"], code)
+                if typical:
+                    cell["vs_typical"] = (rt.total_miles - typical) / typical
+                if ccfg["benchmark_miles"]:
+                    cell["vs_bench"] = ccfg["benchmark_miles"] - rt.total_miles
+            row["cabins"][code] = cell
+        out.append(row)
+    # Cheapest economy first, trips with nothing at the bottom.
+    out.sort(key=lambda r: (r["cabins"].get("Y", {}).get("best") is None,
+                            r["cabins"].get("Y", {}).get("best") or 0))
+    return out
+
+
+def print_overview(cfg: dict, store: Store, ranked: Ranked) -> None:
+    rows = overview_rows(cfg, store, ranked)
+    party = cfg["party_size"]
+    print(f"WHERE TO GO RIGHT NOW  cheapest viable round trip per person, party of {party}")
+    print("? means the program publishes no seat count, so the seats are not confirmed. "
+          "vs typical compares to the median best of the last 3 weeks.\n")
+    print(f"{'trip':16} " + " ".join(f"{CABIN_NAMES[c]:>19}" for c in CABIN_ORDER))
+    print("-" * (17 + 20 * len(CABIN_ORDER)))
+    for r in rows:
+        cells = []
+        for code in CABIN_ORDER:
+            cell = r["cabins"].get(code)
+            if not cell or cell["best"] is None:
+                cells.append(f"{'-':>19}")
+                continue
+            mark = "" if cell["status"] == "confirmed" else " ?"
+            typ = cell["vs_typical"]
+            gap = f" {typ:+.0%}" if typ is not None else ""
+            cells.append(f"{cell['best']:>12,}{mark:2}{gap:>5}")
+        print(f"{r['label']:16} " + " ".join(cells))
+    print()
+    # Per cabin, the trip that wins outright. Reads like a tip sheet.
+    tips = []
+    for code in CABIN_ORDER:
+        best = [(r["cabins"][code]["best"], r["label"]) for r in rows
+                if code in r["cabins"] and r["cabins"][code]["best"] is not None]
+        if best:
+            miles, label = min(best)
+            tips.append(f"{CABIN_NAMES[code].lower()} {label} at {miles:,}")
+    if tips:
+        print("Cheapest by cabin  " + ", ".join(tips))
+    print()
+
+
+def show_best(cfg: dict, store: Store, limit: int = 15, trip_key: str | None = None,
+              cabin: str | None = None) -> None:
+    party, alert_cfg = cfg["party_size"], cfg["alerting"]
     age_hours = alert_cfg["max_data_age_hours"] * 24
     legs = store.latest_legs(age_hours)
-    ranked = rank_by_cabin(cfg, legs)
-    seen = {code: sum(1 for l in legs if l.cabin == code) for code in CABIN_ORDER}
+    ranked = rank_all(cfg, legs)
 
-    cabins = enabled_cabins(cfg)
-    if cabin:
-        cabins = [c for c in cabins if c["code"] == cabin]
-        if not cabins:
-            raise SystemExit(f"--cabin {cabin} is not an enabled cabin. Enabled: "
-                             + ", ".join(c["code"] for c in enabled_cabins(cfg)))
+    trips = enabled_trips(cfg)
+    if trip_key:
+        trips = [t for t in trips if t["key"] == trip_key]
+        if not trips:
+            raise SystemExit(f"--trip {trip_key} is not an enabled trip. Enabled: "
+                             + ", ".join(t["key"] for t in enabled_trips(cfg)))
 
-    routes = f"{'/'.join(trip['outbound_origins'])} to {'/'.join(trip['outbound_destinations'])}"
     # A GitHub job summary renders markdown, which would collapse the columns.
-    # Fence the whole table there. Plain terminals get plain text.
+    # Fence the whole report there. Plain terminals get plain text.
     fence = os.environ.get("GITHUB_ACTIONS") == "true"
     if fence:
         print("```")
-    print(f"\nCheapest round trips for {party}, {routes}, per person, "
-          f"data from the last {age_hours // 24} days")
+    print(f"\nCheapest round trips for {party} from {'/'.join(cfg['origins'])}, per person, "
+          f"data from the last {age_hours // 24} days\n")
     if not legs:
-        print("Nothing recorded yet. Run --sweep first.")
-    print()
-    for c in cabins:
-        print_best_section(c, ranked[c["code"]], seen[c["code"]], party, trip, limit,
-                           show_cabins=trip.get("allow_mixed_cabin", False))
+        print("Nothing recorded yet. Run --sweep first.\n")
+    if not trip_key and not cabin:
+        print_overview(cfg, store, ranked)
+    for trip in trips:
+        cabins = enabled_cabins(trip)
+        if cabin:
+            cabins = [c for c in cabins if c["code"] == cabin]
+            if not cabins:
+                raise SystemExit(f"--cabin {cabin} is not enabled for {trip['key']}. Enabled: "
+                                 + ", ".join(c["code"] for c in enabled_cabins(trip)))
+        print(f"=== {trip['label'].upper()}  {'/'.join(trip['destinations'])}, "
+              f"{trip['min_trip_nights']} to {trip['max_trip_nights']} nights\n")
+        seen = {code: sum(1 for l in legs if l.cabin == code and
+                          (l.destination in trip["destinations"] or l.origin in trip["destinations"]))
+                for code in CABIN_ORDER}
+        for c in cabins:
+            print_best_section(trip, c, ranked[trip["key"]][c["code"]], seen[c["code"]],
+                               party, limit, show_cabins=cfg["pairing"]["allow_mixed_cabin"])
     if fence:
         print("```")
+
+
+def show_overview(cfg: dict, store: Store) -> None:
+    legs = store.latest_legs(cfg["alerting"]["max_data_age_hours"] * 24)
+    print()
+    print_overview(cfg, store, rank_all(cfg, legs))
 
 
 def show_stats(cfg: dict, store: Store) -> None:
@@ -1215,21 +1444,27 @@ def show_stats(cfg: dict, store: Store) -> None:
         """SELECT cabin, source, origin, destination, COUNT(*) AS n,
                   MIN(miles) AS lo, CAST(AVG(miles) AS INT) AS avg, MAX(miles) AS hi,
                   MIN(observed_at) AS first, MAX(observed_at) AS last
-           FROM observations GROUP BY cabin, source, origin, destination
-           ORDER BY cabin, lo"""
+           FROM observations GROUP BY cabin, source, origin, destination"""
     ).fetchall()
     if not rows:
         print("No observations yet.")
         return
+    d2t = cfg["dest_to_trip"]
+
+    def trip_of(r) -> str:
+        return d2t.get(r["destination"]) or d2t.get(r["origin"]) or "other"
+
     print(f"\nObservation history, one-way legs per person\n")
     print(f"{'cab':4} {'source':14} {'route':9} {'ticks':>7} {'min':>9} {'avg':>9} "
           f"{'max':>9}  {'first seen':10}  last seen")
     print("-" * 92)
     current = None
-    for r in sorted(rows, key=lambda r: (_cabin_rank(r["cabin"]), r["lo"])):
-        if r["cabin"] != current:
-            current = r["cabin"]
-            print(f"{CABIN_NAMES.get(current, current)}")
+    for r in sorted(rows, key=lambda r: (trip_of(r), _cabin_rank(r["cabin"]), r["lo"])):
+        head = (trip_of(r), r["cabin"])
+        if head != current:
+            current = head
+            label = cfg["trips"].get(head[0], {}).get("label", head[0])
+            print(f"{label}, {CABIN_NAMES.get(head[1], head[1])}")
         print(f"{r['cabin']:4} {r['source']:14} {r['origin']}-{r['destination']:5} "
               f"{r['n']:>7} {r['lo']:>9,} {r['avg']:>9,} {r['hi']:>9,}  "
               f"{r['first'][:10]}  {r['last'][:10]}")
@@ -1238,7 +1473,8 @@ def show_stats(cfg: dict, store: Store) -> None:
 
 def budget_plan(cfg: dict, store: Store) -> dict:
     """Calls per day in either mode, multiplied by the pagination measured on
-    the last sweep. Nothing here makes a live call.
+    the last sweep. Nothing here makes a live call. A window is one trip and
+    one date range, two directions.
 
     loop       one process, sweeps every sweep_interval_hours and focus polls
                every focus_interval_minutes in between
@@ -1251,19 +1487,21 @@ def budget_plan(cfg: dict, store: Store) -> dict:
     stats = store.get_state("sweep_stats") or {}
     measured = stats.get("calls_per_window")
     per_window = measured if measured else 2.0
+    trips = len(enabled_trips(cfg))
     if scan["mode"] == "scheduled":
         sweeps = float(scan["sweeps_per_day"])
         focus_polls = float(scan["polls_per_day"])
     else:
         sweeps = 24 / scan["sweep_interval_hours"]
         focus_polls = (24 * 60) / scan["focus_interval_minutes"] - sweeps
-    per_sweep = len(chunks) * per_window
+    windows = len(chunks) * trips
+    per_sweep = windows * per_window
     per_poll = scan["max_focus_windows"] * per_window
     sweep_calls = per_sweep * sweeps
     focus_calls = per_poll * focus_polls
     return {
-        "mode": scan["mode"], "windows": len(chunks), "sweeps": sweeps,
-        "focus_polls": focus_polls, "cap": cap, "measured": measured,
+        "mode": scan["mode"], "windows": windows, "chunks": len(chunks), "trips": trips,
+        "sweeps": sweeps, "focus_polls": focus_polls, "cap": cap, "measured": measured,
         "per_window": per_window, "per_sweep": per_sweep, "per_poll": per_poll,
         "sweep_calls": sweep_calls, "focus_calls": focus_calls,
         "planned": sweep_calls + focus_calls, "stats": stats,
@@ -1273,7 +1511,6 @@ def budget_plan(cfg: dict, store: Store) -> dict:
 def show_budget(cfg: dict, store: Store) -> None:
     p = budget_plan(cfg, store)
     h, scan, api = cfg["horizon"], cfg["scan"], cfg["api"]
-    codes, sources = query_plan(cfg)
     if p["mode"] == "scheduled":
         print(f"\nMode        scheduled, GitHub Actions runs --once {p['focus_polls']:.0f} "
               f"times and --sweep {p['sweeps']:.0f} times a day")
@@ -1281,9 +1518,13 @@ def show_budget(cfg: dict, store: Store) -> None:
         print(f"\nMode        loop, one process sweeping every {scan['sweep_interval_hours']}h "
               f"and polling every {scan['focus_interval_minutes']}min")
     print(f"Horizon     {h['min_days_out']} to {h['max_days_out']} days out, "
-          f"{p['windows']} windows of {h['chunk_days']} days")
-    print(f"Per call    cabins {''.join(codes)}, {len(sources)} sources, "
-          f"{api['page_size']} rows per page, up to {api['max_pages_per_query']} pages")
+          f"{p['chunks']} date ranges of {h['chunk_days']} days x {p['trips']} trips "
+          f"= {p['windows']} windows")
+    for trip in enabled_trips(cfg):
+        codes, sources = query_plan(trip)
+        print(f"  {trip['key']:11} {'/'.join(trip['destinations']):16} cabins {''.join(codes)}, "
+              f"{len(sources)} sources")
+    print(f"Per call    {api['page_size']} rows per page, up to {api['max_pages_per_query']} pages")
     if p["measured"]:
         stats = p["stats"]
         capped = stats.get("capped_windows", 0)
@@ -1309,7 +1550,7 @@ def show_budget(cfg: dict, store: Store) -> None:
         line += f", {header} reports {quota} left"
     print(line)
     if p["planned"] > p["cap"]:
-        fix = ("Raise horizon.chunk_days or lower scan.max_focus_windows"
+        fix = ("Raise horizon.chunk_days, lower scan.max_focus_windows or disable a trip"
                if p["mode"] == "scheduled" else
                "Raise horizon.chunk_days, scan.sweep_interval_hours or scan.focus_interval_minutes")
         print(f"\nOVER BUDGET. {fix}, then run --budget again.")
@@ -1320,12 +1561,113 @@ def show_budget(cfg: dict, store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard export
+# ---------------------------------------------------------------------------
+
+
+def compact_history(rows: list, now: datetime) -> list[dict]:
+    """Every snapshot from the last two days, then one point per day, the
+    day's cheapest, further back. Enough for a sparkline without pushing a
+    megabyte to the state branch fifty times a day."""
+    cutoff = (now - timedelta(days=DASHBOARD_HISTORY_FULL_DAYS)).isoformat()
+    by_day: dict[str, dict] = {}
+    out: list[dict] = []
+    for r in rows:
+        point = {"at": r["at"], "best": r["best_miles"], "viable": r["viable"]}
+        if r["at"] >= cutoff:
+            out.append(point)
+            continue
+        day = r["at"][:10]
+        cur = by_day.get(day)
+        if cur is None or (point["best"] is not None and (cur["best"] is None or point["best"] < cur["best"])):
+            by_day[day] = point
+    return [by_day[d] for d in sorted(by_day)] + out
+
+
+def dashboard_data(cfg: dict, store: Store) -> dict:
+    """Everything the dashboard shows, as plain JSON. Same ranking as --best."""
+    party, alert_cfg = cfg["party_size"], cfg["alerting"]
+    age_hours = alert_cfg["max_data_age_hours"] * 24
+    legs = store.latest_legs(age_hours)
+    ranked = rank_all(cfg, legs)
+    plan = budget_plan(cfg, store)
+    now = datetime.now(timezone.utc)
+
+    trips_out = []
+    for trip in enabled_trips(cfg):
+        cabins_out = []
+        for c in enabled_cabins(trip):
+            rows = ranked[trip["key"]][c["code"]]
+            legs_seen = sum(1 for l in legs if l.cabin == c["code"] and
+                            (l.destination in trip["destinations"] or l.origin in trip["destinations"]))
+            typical = store.typical_best(trip["key"], c["code"])
+            history = compact_history(
+                store.snapshot_history(trip["key"], c["code"], DASHBOARD_HISTORY_DAYS), now)
+            rows_out = []
+            for rt, note in rows[:DASHBOARD_ROWS]:
+                status, _ = seat_status(rt, c["min_seats"])
+                rows_out.append({
+                    "out": rt.outbound.depart_date, "back": rt.inbound.depart_date,
+                    "nights": rt.nights, "route": rt.route, "source": rt.outbound.source,
+                    "airlines": rt.outbound.airlines, "cabins": rt.cabin_code,
+                    "miles": rt.total_miles, "party": rt.total_miles * party,
+                    "taxes": rt.total_taxes, "seats": rt.min_seats, "seat_status": status,
+                    "vs_bench": (c["benchmark_miles"] - rt.total_miles) if c["benchmark_miles"] else None,
+                    "nonstop": rt.outbound.direct and rt.inbound.direct,
+                })
+            cabins_out.append({
+                "code": c["code"], "label": c["label"],
+                "benchmark": c["benchmark_miles"], "floor": c["floor_miles"],
+                "ceiling": c["ceiling_miles"], "min_seats": c["min_seats"],
+                "max_taxes": c["max_total_taxes_usd"],
+                "observe_only": c["floor_miles"] is None,
+                "viable": len(rows), "legs_seen": legs_seen,
+                "unconfirmed": sum(1 for r in rows_out if r["seat_status"] != "confirmed"),
+                "unconfirmed_total": sum(1 for rt, _ in rows
+                                         if seat_status(rt, c["min_seats"])[0] != "confirmed"),
+                "best": rows[0][0].total_miles if rows else None,
+                "typical": typical, "rows": rows_out, "history": history,
+            })
+        trips_out.append({
+            "key": trip["key"], "label": trip["label"],
+            "destinations": trip["destinations"],
+            "nights": [trip["min_trip_nights"], trip["max_trip_nights"]],
+            "cabins": cabins_out,
+        })
+
+    last_sweep = store.get_state("last_sweep")
+    return {
+        "generated_at": now.isoformat(),
+        "party_size": party, "origins": cfg["origins"],
+        "data_age_days": age_hours // 24,
+        "last_sweep": last_sweep,
+        "fresh_legs": len(legs),
+        "budget": {
+            "mode": plan["mode"], "planned": round(plan["planned"]), "cap": plan["cap"],
+            "daily_cap": cfg["api"]["daily_call_budget"],
+            "used_today": store.calls_today(), "quota_remaining": store.quota_remaining_today(),
+            "calls_per_window": plan["per_window"], "measured": bool(plan["measured"]),
+        },
+        "overview": overview_rows(cfg, store, ranked),
+        "trips": trips_out,
+    }
+
+
+def export_dashboard(cfg: dict, store: Store, path: str) -> None:
+    data = dashboard_data(cfg, store)
+    with open(path, "w") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    LOG.info("Dashboard data written to %s, %d trips", path, len(data["trips"]))
+
+
+# ---------------------------------------------------------------------------
 # Calibration
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Calibration:
+    trip: str
     cabin: str
     combos: int = 0
     first_seen: str | None = None
@@ -1341,7 +1683,7 @@ class Calibration:
     refusal: str | None = None
 
 
-def percentile(values: list[int], p: float) -> float:
+def percentile(values: list[int] | list[float], p: float) -> float:
     """Linear interpolation between closest ranks, same as numpy's default."""
     if not values:
         raise ValueError("percentile of empty list")
@@ -1359,85 +1701,91 @@ def round_to(value: float, step: int) -> int:
     return int(round(value / step) * step)
 
 
-def calibrate(cfg: dict, store: Store) -> dict[str, Calibration]:
-    """Percentiles of viable round trip totals per cabin over the whole
-    retained history, latest price per leg. Refuses on thin history."""
+def calibrate(cfg: dict, store: Store) -> dict[tuple[str, str], Calibration]:
+    """Percentiles of viable round trip totals per trip and cabin over the
+    whole retained history, latest price per leg. Refuses on thin history."""
     legs = store.history_legs()
-    ranked = rank_by_cabin(cfg, legs)
+    ranked = rank_all(cfg, legs)
     span = store.history_span()
-    out: dict[str, Calibration] = {}
-    for c in enabled_cabins(cfg):
-        code = c["code"]
-        cal = Calibration(cabin=code)
-        totals = [rt.total_miles for rt, _ in ranked[code]]
-        cal.combos = len(totals)
-        if code in span:
-            first, last, _ = span[code]
-            cal.first_seen, cal.last_seen = first[:10], last[:10]
-            cal.span_days = (datetime.fromisoformat(last) - datetime.fromisoformat(first)
-                             ).total_seconds() / 86400
-        problems = []
-        if cal.combos < CALIBRATE_MIN_COMBOS:
-            problems.append(f"{CALIBRATE_MIN_COMBOS} viable combinations (have {cal.combos})")
-        if cal.span_days < CALIBRATE_MIN_DAYS:
-            problems.append(f"{CALIBRATE_MIN_DAYS} days of history (have {cal.span_days:.0f})")
-        if totals:
-            cal.minimum = min(totals)
-            cal.p10 = percentile(totals, 10)
-            cal.median = percentile(totals, 50)
-            cal.p90 = percentile(totals, 90)
-            if c["benchmark_miles"]:
-                below = sum(1 for t in totals if t < c["benchmark_miles"])
-                cal.benchmark_pct = 100.0 * below / len(totals)
-        if problems:
-            cal.refusal = "need " + " and ".join(problems)
-        else:
-            cal.floor = round_to(cal.p10, 5000)
-            cal.ceiling = round_to(cal.median, 5000)
-            if cal.floor >= cal.ceiling:
-                cal.refusal = (f"prices are too tightly clustered, p10 {cal.p10:,.0f} and "
-                               f"median {cal.median:,.0f} round to the same figure")
-                cal.floor = cal.ceiling = None
-        out[code] = cal
+    out: dict[tuple[str, str], Calibration] = {}
+    for trip in enabled_trips(cfg):
+        for c in enabled_cabins(trip):
+            code = c["code"]
+            cal = Calibration(trip=trip["key"], cabin=code)
+            totals = [rt.total_miles for rt, _ in ranked[trip["key"]][code]]
+            cal.combos = len(totals)
+            if code in span:
+                first, last, _ = span[code]
+                cal.first_seen, cal.last_seen = first[:10], last[:10]
+                cal.span_days = (datetime.fromisoformat(last) - datetime.fromisoformat(first)
+                                 ).total_seconds() / 86400
+            problems = []
+            if cal.combos < CALIBRATE_MIN_COMBOS:
+                problems.append(f"{CALIBRATE_MIN_COMBOS} viable combinations (have {cal.combos})")
+            if cal.span_days < CALIBRATE_MIN_DAYS:
+                problems.append(f"{CALIBRATE_MIN_DAYS} days of history (have {cal.span_days:.0f})")
+            if totals:
+                cal.minimum = min(totals)
+                cal.p10 = percentile(totals, 10)
+                cal.median = percentile(totals, 50)
+                cal.p90 = percentile(totals, 90)
+                if c["benchmark_miles"]:
+                    below = sum(1 for t in totals if t < c["benchmark_miles"])
+                    cal.benchmark_pct = 100.0 * below / len(totals)
+            if problems:
+                cal.refusal = "need " + " and ".join(problems)
+            else:
+                cal.floor = round_to(cal.p10, 5000)
+                cal.ceiling = round_to(cal.median, 5000)
+                if cal.floor >= cal.ceiling:
+                    cal.refusal = (f"prices are too tightly clustered, p10 {cal.p10:,.0f} and "
+                                   f"median {cal.median:,.0f} round to the same figure")
+                    cal.floor = cal.ceiling = None
+            out[(trip["key"], code)] = cal
     return out
 
 
 def show_calibrate(cfg: dict, store: Store) -> None:
     results = calibrate(cfg, store)
-    pad = max(len(c["label"]) for c in enabled_cabins(cfg)) + 2
+    pad = max(len(c["label"]) for t in enabled_trips(cfg) for c in enabled_cabins(t)) + 2
     print("\nCALIBRATE  thresholds proposed from stored round trip totals")
     print(f"Viable combinations only (seats for the party, taxes under the cabin cap), "
           f"latest price per leg, whole retained history.\n")
-    proposals: list[tuple[dict, Calibration]] = []
-    for c in enabled_cabins(cfg):
-        cal = results[c["code"]]
-        label = c["label"].upper().ljust(pad)
-        indent = " " * pad
-        when = (f"{cal.first_seen} to {cal.last_seen}" if cal.first_seen else "no observations")
-        print(f"{label}{cal.combos:,} combinations, {cal.span_days:.0f} days of history ({when})")
-        if cal.minimum is not None:
-            print(f"{indent}min {cal.minimum:,}   p10 {cal.p10:,.0f}   "
-                  f"median {cal.median:,.0f}   p90 {cal.p90:,.0f}")
-        if cal.benchmark_pct is not None:
-            print(f"{indent}{cal.benchmark_pct:.0f}% of combinations beat the "
-                  f"{c['benchmark_miles']:,} benchmark")
-        if cal.refusal:
-            print(f"{indent}refused, {cal.refusal}")
-        else:
-            print(f"{indent}proposed floor {cal.floor:,} (p10 rounded to 5,000), "
-                  f"ceiling {cal.ceiling:,} (median rounded to 5,000)")
-            proposals.append((c, cal))
+    proposals: dict[str, list[tuple[dict, Calibration]]] = {}
+    for trip in enabled_trips(cfg):
+        print(f"=== {trip['label'].upper()}")
+        for c in enabled_cabins(trip):
+            cal = results[(trip["key"], c["code"])]
+            label = c["label"].upper().ljust(pad)
+            indent = " " * pad
+            when = (f"{cal.first_seen} to {cal.last_seen}" if cal.first_seen else "no observations")
+            print(f"{label}{cal.combos:,} combinations, {cal.span_days:.0f} days of history ({when})")
+            if cal.minimum is not None:
+                print(f"{indent}min {cal.minimum:,}   p10 {cal.p10:,.0f}   "
+                      f"median {cal.median:,.0f}   p90 {cal.p90:,.0f}")
+            if cal.benchmark_pct is not None:
+                print(f"{indent}{cal.benchmark_pct:.0f}% of combinations beat the "
+                      f"{c['benchmark_miles']:,} benchmark")
+            if cal.refusal:
+                print(f"{indent}refused, {cal.refusal}")
+            else:
+                print(f"{indent}proposed floor {cal.floor:,} (p10 rounded to 5,000), "
+                      f"ceiling {cal.ceiling:,} (median rounded to 5,000)")
+                proposals.setdefault(trip["key"], []).append((c, cal))
         print()
 
     if not proposals:
-        print("Nothing to propose yet. Keep the loop running and try again later.")
+        print("Nothing to propose yet. Keep the schedule running and try again later.")
         return
-    print("Paste into config.yaml under cabins, then run --self-test and --budget.\n")
-    print("cabins:")
-    for c, cal in proposals:
-        print(f"  {c['code']}:")
-        print(f"    floor_miles: {cal.floor:<12}# p10 {cal.p10:,.0f}")
-        print(f"    ceiling_miles: {cal.ceiling:<10}# median {cal.median:,.0f}")
+    print("Paste into config.yaml under trips, then run --self-test and --budget.\n")
+    print("trips:")
+    for key, items in proposals.items():
+        print(f"  {key}:")
+        print(f"    cabins:")
+        for c, cal in items:
+            print(f"      {c['code']}:")
+            print(f"        floor_miles: {cal.floor:<12}# p10 {cal.p10:,.0f}")
+            print(f"        ceiling_miles: {cal.ceiling:<10}# median {cal.median:,.0f}")
     print()
 
 
@@ -1456,39 +1804,30 @@ api:
   page_size: 500
 horizon: {min_days_out: 45, max_days_out: 331, chunk_days: 31}
 scan: {sweep_interval_hours: 6, focus_interval_minutes: 15, max_focus_windows: 3}
-trip:
-  party_size: 4
-  outbound_origins: [JFK, EWR]
-  outbound_destinations: [SYD, MEL]
-  min_trip_nights: 10
-  max_trip_nights: 35
-  require_same_source: true
-  allow_open_jaw: false
-  allow_mixed_cabin: false
+party_size: 4
+origins: [JFK, EWR]
+pairing: {require_same_source: true, allow_open_jaw: false, allow_mixed_cabin: false}
 cabins:
-  Y:
-    sources: [delta, qantas]
-    benchmark_miles: 66200
-    floor_miles: 60000
-    ceiling_miles: 72000
-    new_best_margin_miles: 3000
-    max_total_taxes_usd: 400
-    pushover_priority: 1
-  W:
-    sources: [delta, qantas]
-    new_best_margin_miles: 8000
-    max_total_taxes_usd: 500
-  J:
-    sources: [delta, qantas]
-    floor_miles: 250000
-    ceiling_miles: 320000
-    new_best_margin_miles: 20000
-    max_total_taxes_usd: 800
-  F:
-    sources: [qantas]
-    new_best_margin_miles: 40000
-    max_total_taxes_usd: 1200
-    min_seats: 2
+  Y: {sources: [delta, qantas], max_total_taxes_usd: 400, pushover_priority: 1, new_best_margin_miles: 3000}
+  W: {sources: [delta, qantas], max_total_taxes_usd: 500, new_best_margin_miles: 8000}
+  J: {sources: [delta, qantas], max_total_taxes_usd: 800, new_best_margin_miles: 20000}
+  F: {sources: [qantas], max_total_taxes_usd: 1200, new_best_margin_miles: 40000, min_seats: 2}
+trips:
+  australia:
+    label: Australia
+    destinations: [SYD, MEL]
+    min_trip_nights: 10
+    max_trip_nights: 35
+    cabins:
+      Y: {benchmark_miles: 66200, floor_miles: 60000, ceiling_miles: 72000}
+      J: {floor_miles: 250000, ceiling_miles: 320000}
+  mexico:
+    label: Mexico
+    destinations: [MEX, SJD]
+    min_trip_nights: 5
+    max_trip_nights: 14
+    cabins:
+      Y: {floor_miles: 20000, ceiling_miles: 30000, max_total_taxes_usd: 250}
 alerting:
   max_data_age_hours: 12
   require_seat_count: false
@@ -1535,6 +1874,13 @@ def _expect_fail(fn, needle: str) -> None:
     raise AssertionError(f"expected failure mentioning '{needle}'")
 
 
+def _quiet(fn, *args, **kwargs) -> str:
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn(*args, **kwargs)
+    return buf.getvalue()
+
+
 def self_test() -> None:
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
@@ -1542,11 +1888,15 @@ def self_test() -> None:
     store = Store(":memory:")
 
     # -- config -------------------------------------------------------------
-    assert list(cfg["cabins"]) == ["Y", "W", "J", "F"]
-    assert cfg["cabins"]["W"]["min_seats"] == 4 and cfg["cabins"]["F"]["min_seats"] == 2
-    assert cfg["cabins"]["W"]["floor_miles"] is None
-    codes, sources = query_plan(cfg)
-    assert codes == ["Y", "W", "J", "F"] and sources == ["delta", "qantas"], (codes, sources)
+    au, mx = cfg["trips"]["australia"], cfg["trips"]["mexico"]
+    assert list(au["cabins"]) == ["Y", "W", "J", "F"] and list(mx["cabins"]) == ["Y", "W", "J", "F"]
+    assert au["cabins"]["Y"]["floor_miles"] == 60000 and mx["cabins"]["Y"]["floor_miles"] == 20000
+    assert mx["cabins"]["Y"]["max_total_taxes_usd"] == 250, "trip override wins"
+    assert au["cabins"]["Y"]["max_total_taxes_usd"] == 400, "global default holds"
+    assert au["cabins"]["W"]["floor_miles"] is None and mx["cabins"]["J"]["floor_miles"] is None
+    assert au["cabins"]["F"]["min_seats"] == 2 and au["cabins"]["W"]["min_seats"] == 4
+    assert cfg["dest_to_trip"] == {"SYD": "australia", "MEL": "australia", "MEX": "mexico", "SJD": "mexico"}
+    assert query_plan(au) == (["Y", "W", "J", "F"], ["delta", "qantas"])
 
     def broken(mutate):
         raw = yaml.safe_load(SELF_TEST_CONFIG)
@@ -1554,17 +1904,21 @@ def self_test() -> None:
         return lambda: validate_config(raw, source="cfg")
 
     _expect_fail(broken(lambda r: r["cabins"].update({"P": {"sources": ["delta"]}})), "unknown cabin")
-    _expect_fail(broken(lambda r: r["cabins"]["Y"].update({"floor_miles": 80000})), "above ceiling")
-    _expect_fail(broken(lambda r: r["cabins"]["J"].update({"ceiling_miles": None})), "both")
-    _expect_fail(broken(lambda r: r["trip"].update({"cabins": ["Y"]})), "predates")
+    _expect_fail(broken(lambda r: r["cabins"]["Y"].update({"floor_miles": 1})), "Prices live per trip")
+    _expect_fail(broken(lambda r: r["trips"]["australia"]["cabins"]["Y"].update({"floor_miles": 80000})), "above ceiling")
+    _expect_fail(broken(lambda r: r["trips"]["australia"]["cabins"]["J"].update({"ceiling_miles": None})), "both")
+    _expect_fail(broken(lambda r: r.update({"trip": {"party_size": 4}})), "predates trips")
+    _expect_fail(broken(lambda r: r["trips"]["mexico"]["destinations"].append("SYD")), "already belongs")
+    _expect_fail(broken(lambda r: r["trips"]["mexico"]["destinations"].append("JFK")), "also an origin")
     _expect_fail(broken(lambda r: r["cabins"]["F"].update({"min_seats": 9})), "above party_size")
-    print("config ok: defaults applied, four bad configs rejected loudly")
+    _expect_fail(broken(lambda r: r["scan"].update({"mode": "cron"})), "scan.mode")
+    print("config ok: trips resolve cabin defaults, nine bad configs rejected loudly")
 
     # -- horizon ------------------------------------------------------------
     chunks = horizon_chunks(cfg, today=date(2026, 8, 15))
     assert chunks[0][0] == "2026-09-29", chunks[0]
     assert chunks[-1][1] == "2027-07-12", chunks[-1]
-    print(f"horizon ok: {len(chunks)} windows, {chunks[0][0]} to {chunks[-1][1]}")
+    print(f"horizon ok: {len(chunks)} date ranges, {chunks[0][0]} to {chunks[-1][1]}")
 
     # -- parsing ------------------------------------------------------------
     def av(oid, source, o, d, day, **cabins):
@@ -1604,7 +1958,6 @@ def self_test() -> None:
     assert legs[2].direct is True and legs[1].direct is False
     assert parse_availability(dict(sample, YAvailable=False), ["Y"]) == []
     assert parse_availability(dict(sample, YMileageCost="0"), ["Y"]) == []
-    # The one real row from the probe, trimmed to the fields the parser reads.
     live = {"ID": "x", "Route": {"OriginAirport": "BOS", "DestinationAirport": "SYD", "Source": "qantas"},
             "Date": "2026-10-26", "YAvailable": True, "YMileageCost": "69900",
             "YRemainingSeats": 1, "YTotalTaxes": 40860, "YAirlines": "EK", "YDirect": False,
@@ -1614,7 +1967,7 @@ def self_test() -> None:
     assert leg[0].seats == 1 and leg[0].last_seen.startswith("2026-09-10")
     print("parse ok: live response shape, string mileage, taxes in minor units, UpdatedAt")
 
-    # -- fixtures -----------------------------------------------------------
+    # -- fixtures, two trips ------------------------------------------------
     raw = [
         av("o1", "delta", "JFK", "SYD", "2027-02-10", Y=(33100, 6, 6600)),     # April benchmark
         av("o2", "delta", "JFK", "SYD", "2027-03-14", Y=(27000, 5, 6600)),     # cheaper outbound
@@ -1630,75 +1983,89 @@ def self_test() -> None:
         av("f2", "qantas", "SYD", "JFK", "2027-07-20", F=(200000, 2, 50000)),
         av("f3", "delta", "JFK", "SYD", "2027-07-02", F=(150000, 4, 50000)),   # delta is not an F source
         av("f4", "delta", "SYD", "JFK", "2027-07-21", F=(150000, 4, 50000)),
+        av("m1", "delta", "JFK", "MEX", "2027-01-10", Y=(9000, 0, 3000)),      # mexico, no seat count
+        av("m2", "delta", "MEX", "JFK", "2027-01-17", Y=(9000, 0, 3000)),      # 7 nights
+        av("m3", "delta", "JFK", "SJD", "2027-02-01", Y=(12500, 4, 3000)),
+        av("m4", "delta", "SJD", "JFK", "2027-02-09", Y=(12500, 4, 3000)),     # 8 nights, confirmed
+        av("m5", "delta", "MEX", "JFK", "2027-03-01", Y=(9000, 4, 3000)),      # 50 nights from m1, too long
     ]
     legs = [leg for obj in raw for leg in parse_availability(obj, CABIN_ORDER)]
     assert len(legs) == len(raw), len(legs)
     store.record_legs(legs)
 
-    # -- pairing ------------------------------------------------------------
+    # -- pairing per trip ---------------------------------------------------
     fresh = store.latest_legs(48)
-    pairs = build_round_trips(fresh, cfg["trip"])
-    assert all(not p.mixed for p in pairs), "mixed cabin pairing leaked through"
-    totals = sorted({p.total_miles for p in pairs})
+    au_pairs = build_round_trips(fresh, cfg["origins"], au["destinations"], 10, 35, cfg["pairing"], "australia")
+    assert all(not p.mixed and p.trip == "australia" for p in au_pairs)
+    assert all(p.outbound.destination in ("SYD", "MEL") for p in au_pairs), "trip must not see other cities"
+    totals = sorted({p.total_miles for p in au_pairs})
     assert 54000 in totals and 285000 in totals and 140000 in totals, totals
-    mixed_trip = dict(cfg["trip"], allow_mixed_cabin=True)
-    mixed_pairs = build_round_trips(fresh, mixed_trip)
-    mixed = [p for p in mixed_pairs if p.mixed]
+    mixed_pairing = dict(cfg["pairing"], allow_mixed_cabin=True)
+    mixed = [p for p in build_round_trips(fresh, cfg["origins"], au["destinations"], 10, 35, mixed_pairing) if p.mixed]
     assert mixed and all(p.cabin == "Y" for p in mixed if "Y" in p.cabin_code), "mixed ranks under lower cabin"
-    assert len(mixed_pairs) > len(pairs)
-    print(f"pairing ok: {len(pairs)} same-cabin combos, {len(mixed)} mixed rejected by default")
+    print(f"pairing ok: {len(au_pairs)} same-cabin combos for Australia, {len(mixed)} mixed rejected by default")
 
-    # -- viability per cabin ------------------------------------------------
-    ranked = rank_by_cabin(cfg, fresh)
-    assert [rt.total_miles for rt, _ in ranked["Y"]] == [54000, 66200], ranked["Y"]
-    assert ranked["W"][0][0].total_miles == 140000
-    assert ranked["J"][0][0].total_miles == 285000
-    assert [rt.outbound.source for rt, _ in ranked["F"]] == ["qantas"], "delta F must be filtered by sources"
-    assert ranked["F"][0][0].min_seats == 2, "F min_seats override"
-    print("ranking ok: Y needs 4 seats, F accepts 2, F ignores non-F sources")
+    # -- ranking and seat status --------------------------------------------
+    ranked = rank_all(cfg, fresh)
+    assert set(ranked) == {"australia", "mexico"}
+    assert [rt.total_miles for rt, _ in ranked["australia"]["Y"]] == [54000, 66200]
+    assert ranked["australia"]["W"][0][0].total_miles == 140000
+    assert ranked["australia"]["J"][0][0].total_miles == 285000
+    assert [rt.outbound.source for rt, _ in ranked["australia"]["F"]] == ["qantas"], "delta F filtered by sources"
+    assert ranked["australia"]["F"][0][0].min_seats == 2, "F min_seats override"
+    mx_rows = ranked["mexico"]["Y"]
+    assert [rt.total_miles for rt, _ in mx_rows] == [18000, 25000], mx_rows
+    assert seat_status(mx_rows[0][0], 4) == ("unpublished", "seats unpublished, verify before booking")
+    assert seat_status(mx_rows[1][0], 4) == ("confirmed", "4 seats confirmed")
+    assert seat_status(RoundTrip(legs[0], legs[4]), 4)[0] == "short"
+    strict = copy.deepcopy(cfg)
+    strict["alerting"]["require_seat_count"] = True
+    assert [rt.total_miles for rt, _ in rank_all(strict, fresh)["mexico"]["Y"]] == [25000], \
+        "require_seat_count drops unpublished rows"
+    print("ranking ok: per trip, Y needs 4 seats, F accepts 2, unpublished counts are flagged not trusted")
 
     # -- alert gating -------------------------------------------------------
-    y_best, j_best, w_best = ranked["Y"][0][0], ranked["J"][0][0], ranked["W"][0][0]
-    assert alert_reason(y_best, None, cfg["cabins"]["Y"]) == "under floor"
-    assert alert_reason(ranked["Y"][1][0], 54000, cfg["cabins"]["Y"]) is None, "66,200 above 60,000 floor with 54,000 best"
-    expensive = RoundTrip(legs[0], legs[2])
-    over = dict(cfg["cabins"]["Y"], ceiling_miles=65000)
-    assert alert_reason(expensive, None, over) is None, "above ceiling"
-    assert alert_reason(w_best, None, cfg["cabins"]["W"]) is None, "null thresholds never alert"
-    assert alert_reason(j_best, None, cfg["cabins"]["J"]) == "first qualifying combination"
-    assert y_best.key() != RoundTrip(legs[5], legs[6]).key()
-    same_dates_y = Leg(**dict(asdict(legs[5]), cabin="Y"))
-    same_dates_y_back = Leg(**dict(asdict(legs[6]), cabin="Y"))
-    assert RoundTrip(legs[5], legs[6]).key() != RoundTrip(same_dates_y, same_dates_y_back).key(), \
-        "dedupe key must include cabin"
-    print("alert gating ok: floor fires, ceiling suppresses, null thresholds silent, key carries cabin")
+    y_best, j_best, w_best = (ranked["australia"][c][0][0] for c in ("Y", "J", "W"))
+    assert alert_reason(y_best, None, au["cabins"]["Y"]) == "under floor"
+    assert alert_reason(ranked["australia"]["Y"][1][0], 54000, au["cabins"]["Y"]) is None
+    over = dict(au["cabins"]["Y"], ceiling_miles=65000)
+    assert alert_reason(RoundTrip(legs[0], legs[2]), None, over) is None, "above ceiling"
+    assert alert_reason(w_best, None, au["cabins"]["W"]) is None, "null thresholds never alert"
+    assert alert_reason(j_best, None, au["cabins"]["J"]) == "first qualifying combination"
+    same_y = RoundTrip(Leg(**dict(asdict(legs[5]), cabin="Y")), Leg(**dict(asdict(legs[6]), cabin="Y")))
+    assert RoundTrip(legs[5], legs[6]).key() != same_y.key(), "dedupe key must include cabin"
+    title, body = format_alert(mx_rows[0][0], "seats unpublished, verify before booking",
+                               "under floor", 4, mx, mx["cabins"]["Y"])
+    assert title == "18k MEXICO ECONOMY DELTA JFK-MEX, seats unconfirmed", title
+    assert "NOT confirmed" in body and FARE_BRAND_REMINDER in body
+    title, _ = format_alert(mx_rows[1][0], "4 seats confirmed", "under floor", 4, mx, mx["cabins"]["Y"])
+    assert title == "25k MEXICO ECONOMY DELTA JFK-SJD", title
+    print("alert gating ok: floor fires, ceiling suppresses, null thresholds silent, unconfirmed seats named in the title")
 
-    # -- evaluate, per cabin running best -----------------------------------
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        result = evaluate(cfg, store, dry_run=True)
-    out = buf.getvalue()
-    assert result["Y"][0].total_miles == 54000
-    assert "54k ECONOMY DELTA JFK-SYD" in out, out
-    assert "285k BUSINESS DELTA JFK-SYD" in out, "cheap economy suppressed the business alert"
+    # -- evaluate, per trip and cabin running best --------------------------
+    out = _quiet(evaluate, cfg, store, True)
+    assert "54k AUSTRALIA ECONOMY DELTA JFK-SYD" in out, out
+    assert "285k AUSTRALIA BUSINESS DELTA JFK-SYD" in out, "cheap economy suppressed the business alert"
+    assert "18k MEXICO ECONOMY DELTA JFK-MEX, seats unconfirmed\n" in out, out
+    assert "25k MEXICO" not in out, "25,000 is above the floor and not a new best"
     assert "PREMIUM ECONOMY" not in out and "FIRST" not in out, "observe-only cabins alerted"
-    assert out.count("WOULD ALERT") == 2, out
-    assert "(priority 1)" in out and "(priority 0)" in out
+    assert out.count("WOULD ALERT") == 3, out
     assert "vs economy benchmark 66,200: saves 12,200" in out
-    assert FARE_BRAND_REMINDER in out
-    assert store.get_state("best_total_miles:Y") == 54000
-    assert store.get_state("best_total_miles:J") == 285000
-    assert store.get_state("best_total_miles:W") == 140000, "observe-only cabins still track a best"
-    focus = store.get_state("focus_dates")
-    assert focus[:3] == ["2027-03-14", "2027-06-01", "2027-05-02"], focus
-    print(f"evaluate ok: Y and J alert independently, W and F observe, focus {focus}")
-
-    # second pass must be quiet, everything is deduped
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        evaluate(cfg, store, dry_run=True)
-    assert "WOULD ALERT" not in buf.getvalue(), "alerts repeated on the second pass"
-    print("dedupe ok: second pass is silent")
+    assert store.get_state("best_total_miles:australia:Y") == 54000
+    assert store.get_state("best_total_miles:australia:J") == 285000
+    assert store.get_state("best_total_miles:australia:W") == 140000, "observe-only cabins still track a best"
+    assert store.get_state("best_total_miles:mexico:Y") == 18000
+    focus = store.get_state("focus_windows")
+    assert focus == [{"trip": "australia", "date": "2027-03-14"}, {"trip": "mexico", "date": "2027-01-10"},
+                     {"trip": "australia", "date": "2027-06-01"}], focus
+    snaps = store.conn.execute("SELECT trip, cabin, best_miles, viable, unconfirmed FROM snapshots ORDER BY trip, cabin").fetchall()
+    assert [tuple(r) for r in snaps] == [
+        ("australia", "F", 400000, 1, 0), ("australia", "J", 285000, 1, 0),
+        ("australia", "W", 140000, 1, 0), ("australia", "Y", 54000, 2, 0),
+        ("mexico", "F", None, 0, 0), ("mexico", "J", None, 0, 0),
+        ("mexico", "W", None, 0, 0), ("mexico", "Y", 18000, 2, 1)], [tuple(r) for r in snaps]
+    assert "WOULD ALERT" not in _quiet(evaluate, cfg, store, True), "alerts repeated on the second pass"
+    print(f"evaluate ok: three trips and cabins alert independently, snapshots recorded, second pass silent")
 
     # -- a burst of qualifying pairings is one message ------------------------
     burst = Store(":memory:")
@@ -1707,45 +2074,56 @@ def self_test() -> None:
         day = (date(2027, 3, 13) + timedelta(days=i)).isoformat()
         burst_raw.append(av(f"b{i + 1}", "delta", "SYD", "JFK", day, Y=(27000, 4, 6600)))
     burst.record_legs([leg for obj in burst_raw for leg in parse_availability(obj, CABIN_ORDER)])
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        evaluate(cfg, burst, dry_run=True)
-    out = buf.getvalue()
+    out = _quiet(evaluate, cfg, burst, True)
     assert out.count("WOULD ALERT") == 1, out
-    assert "54k ECONOMY DELTA JFK-SYD +11 more" in out, out
-    assert out.count("2027-03-01 > ") == DIGEST_ROWS and "and 5 more, run --best --cabin Y" in out, out
+    assert "54k AUSTRALIA ECONOMY DELTA JFK-SYD +11 more" in out, out
+    assert out.count("2027-03-01 > ") == DIGEST_ROWS and "and 5 more, run --best --trip australia --cabin Y" in out, out
     assert out.strip().endswith(FARE_BRAND_REMINDER), "reminder must stay last"
-    digest_body = out.split("+11 more\n", 1)[1]
-    assert len(digest_body) <= 1024, f"Pushover cap, {len(digest_body)} chars"
+    assert len(out.split("+11 more\n", 1)[1]) <= 1024, "Pushover cap"
     assert burst.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 12
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        evaluate(cfg, burst, dry_run=True)
-    assert "WOULD ALERT" not in buf.getvalue(), "digest members must be deduped individually"
+    assert "WOULD ALERT" not in _quiet(evaluate, cfg, burst, True)
     print("digest ok: 12 under-floor pairings are one message, all 12 deduped after")
 
-    # -- leaderboard rendering ----------------------------------------------
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        show_best(cfg, store)
-    out = buf.getvalue()
+    # -- leaderboard and overview rendering ---------------------------------
+    out = _quiet(show_best, cfg, store)
+    assert "WHERE TO GO RIGHT NOW" in out and "=== AUSTRALIA  SYD/MEL, 10 to 35 nights" in out
+    assert "=== MEXICO  MEX/SJD, 5 to 14 nights" in out
     for label in ("ECONOMY  benchmark 66,200", "PREMIUM ECONOMY  no benchmark, observe-only",
                   "BUSINESS  no benchmark", "FIRST  no benchmark, observe-only"):
-        assert label in out, f"missing section {label!r}\n{out}"
-    assert "+12,200" in out and "216,000" in out, out       # vs bench and party total
-    assert "1,140,000" in out, "party total for business"
-    assert out.index("ECONOMY") < out.index("PREMIUM") < out.index("BUSINESS") < out.index("FIRST")
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        show_best(cfg, store, cabin="F")
-    only_f = buf.getvalue()
-    assert "FIRST" in only_f and "ECONOMY" not in only_f and "BUSINESS" not in only_f
-    empty = Store(":memory:")
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        show_best(cfg, empty)
-    assert buf.getvalue().count("no availability recorded") == 4, buf.getvalue()
-    print("leaderboard ok: four sections in order, --cabin F alone, empty sections say so")
+        assert label in out, f"missing section {label!r}"
+    assert "+12,200" in out and "216,000" in out and "1,140,000" in out
+    assert "1 with no published seat count (shown as ?)" in out, out
+    assert out.index("=== AUSTRALIA") < out.index("=== MEXICO"), "trip sections keep config order"
+    ov = out.split("WHERE TO GO", 1)[1].split("===", 1)[0]
+    assert ov.index("Mexico") < ov.index("Australia") and "18,000 ?" in ov and "54,000" in ov, ov
+    assert "Cheapest by cabin  economy Mexico at 18,000, premium economy Australia at 140,000" in ov, ov
+    only_f = _quiet(show_best, cfg, store, 15, "australia", "F")
+    assert "FIRST" in only_f and "ECONOMY" not in only_f and "MEXICO" not in only_f
+    assert _quiet(show_best, cfg, Store(":memory:")).count("no availability recorded") == 8
+    os.environ["GITHUB_ACTIONS"] = "true"
+    try:
+        lines = _quiet(show_best, cfg, store).strip().splitlines()
+    finally:
+        del os.environ["GITHUB_ACTIONS"]
+    assert lines[0] == "```" and lines[-1] == "```"
+    print("leaderboard ok: overview first, trips in order, --trip and --cabin filters, fenced under Actions")
+
+    # -- dashboard export ---------------------------------------------------
+    data = dashboard_data(cfg, store)
+    assert [t["key"] for t in data["trips"]] == ["australia", "mexico"]
+    au_y = data["trips"][0]["cabins"][0]
+    assert au_y["code"] == "Y" and au_y["best"] == 54000 and au_y["rows"][0]["seat_status"] == "confirmed"
+    assert au_y["rows"][0]["party"] == 216000 and au_y["rows"][0]["vs_bench"] == 12200
+    mx_y = data["trips"][1]["cabins"][0]
+    assert mx_y["rows"][0]["seat_status"] == "unpublished" and mx_y["unconfirmed"] == 1
+    assert len(au_y["history"]) == 2 and au_y["history"][0]["best"] == 54000
+    old_rows = [{"at": (now_dt - timedelta(days=5, hours=h)).isoformat(), "best_miles": 70000 - h * 100, "viable": 3}
+                for h in range(6)] + [{"at": now, "best_miles": 54000, "viable": 2}]
+    compact = compact_history(old_rows, now_dt)
+    assert len(compact) == 2 and compact[0]["best"] == 69500 and compact[1]["best"] == 54000, compact
+    assert data["overview"][0]["key"] == "mexico" and data["budget"]["cap"] == 900
+    json.dumps(data)
+    print("export ok: dashboard data carries trips, seat status, history and the overview")
 
     # -- pagination protocol ------------------------------------------------
     client = SeatsAero(cfg, store, api_key="test-key")
@@ -1756,14 +2134,13 @@ def self_test() -> None:
         _FakeResponse({"data": [], "count": 0, "hasMore": False, "cursor": 1700000099}, headers=hdr),
     ])
     res = client.cached_search(["JFK"], ["SYD"], ["Y", "J"], ["delta"], "2027-02-01", "2027-03-03")
-    assert len(res.rows) == 3 and res.calls == 3 and not res.capped, (len(res.rows), res.calls)
+    assert len(res.rows) == 3 and res.calls == 3 and not res.capped
     calls = client.session.calls
     assert "cursor" not in calls[0][1] and calls[0][1]["cabins"] == "economy,business", calls[0]
     assert calls[1][1]["cursor"] == 1700000000 and calls[1][1]["skip"] == 2, calls[1]
     assert calls[2][1]["cursor"] == 1700000000 and calls[2][1]["skip"] == 3, "cursor must stay the first one"
     assert store.get_state("quota_header") == "x-ratelimit-remaining"
     assert store.quota_remaining_today() == 990 and store.calls_today() == 3
-
     more = ("/partnerapi/search?take=25&skip=25&origin_airport=JFK&destination_airport=SYD"
             "&cursor=1789152528&start_date=2027-02-01&end_date=2027-03-03&cabins=economy&sources=delta")
     client.session = _FakeSession([
@@ -1771,11 +2148,9 @@ def self_test() -> None:
         _FakeResponse({"data": [raw[1]], "count": 1, "hasMore": False, "cursor": 1789152528, "moreURL": ""}),
     ])
     res = client.cached_search(["JFK"], ["SYD"], ["Y"], ["delta"], "2027-02-01", "2027-03-03")
-    assert res.calls == 2 and client.session.calls[1][0] == "https://seats.aero" + more, client.session.calls[1]
+    assert res.calls == 2 and client.session.calls[1][0] == "https://seats.aero" + more
     assert client.session.calls[1][1] == {}, "moreURL already carries the query"
-
-    client.session = _FakeSession([
-        _FakeResponse({"data": [raw[0]], "hasMore": True, "cursor": 1}) for _ in range(5)])
+    client.session = _FakeSession([_FakeResponse({"data": [raw[0]], "hasMore": True, "cursor": 1}) for _ in range(5)])
     res = client.cached_search(["JFK"], ["SYD"], ["Y"], ["delta"], "2027-02-01", "2027-03-03")
     assert res.capped and res.calls == cfg["api"]["max_pages_per_query"]
     client.session = _FakeSession([_FakeResponse({"message": "bad cabin"}, status=400)])
@@ -1783,36 +2158,20 @@ def self_test() -> None:
     assert res.rows == [] and res.status == 400
     print("pagination ok: first cursor kept, skip accumulates, moreURL followed, page cap flagged")
 
-    # -- budget with measured pagination ------------------------------------
-    assert budget_plan(cfg, store)["per_window"] == 2.0
-    store.set_state("sweep_stats", {"at": now, "windows": 10, "calls": 26,
-                                    "calls_per_window": 2.6, "capped_windows": 1})
+    # -- budget, both modes, windows are trips x date ranges ----------------
     plan = budget_plan(cfg, store)
-    assert plan["per_window"] == 2.6 and plan["sweep_calls"] == 10 * 2.6 * 4, plan
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        show_budget(cfg, store)
-    assert "measured 2.60 calls per window" in buf.getvalue(), buf.getvalue()
-    assert plan["mode"] == "loop" and plan["sweeps"] == 4 and plan["focus_polls"] == 92
-    print("budget ok: loop plan multiplies by measured calls per window")
-
-    # -- budget in scheduled mode ---------------------------------------------
+    assert plan["windows"] == 20 and plan["per_window"] == 2.0 and plan["mode"] == "loop"
+    store.set_state("sweep_stats", {"at": now, "windows": 20, "calls": 52,
+                                    "calls_per_window": 2.6, "capped_windows": 1})
     sched = copy.deepcopy(cfg)
     sched["scan"].update({"mode": "scheduled", "polls_per_day": 48, "sweeps_per_day": 4})
     plan = budget_plan(sched, store)
     close = math.isclose
-    assert close(plan["per_sweep"], 26) and close(plan["per_poll"], 7.8), plan
-    assert close(plan["sweep_calls"], 104) and close(plan["focus_calls"], 374.4), plan
-    assert close(plan["planned"], 478.4) and plan["planned"] < 900, plan
-    fresh_plan = budget_plan(sched, Store(":memory:"))
-    assert fresh_plan["planned"] == 4 * 20 + 48 * 6, fresh_plan
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        show_budget(sched, store)
-    out = buf.getvalue()
-    assert "Mode        scheduled" in out and "--once 48 times" in out and "Polls       48/day" in out, out
-    _expect_fail(broken(lambda r: r["scan"].update({"mode": "cron"})), "scan.mode")
-    print(f"budget ok: scheduled plan is {plan['planned']:.0f} calls a day at measured pagination")
+    assert close(plan["per_sweep"], 52) and close(plan["per_poll"], 7.8), plan
+    assert close(plan["planned"], 4 * 52 + 48 * 7.8) and plan["planned"] < 900, plan
+    out = _quiet(show_budget, sched, store)
+    assert "Mode        scheduled" in out and "= 20 windows" in out and "measured 2.60 calls" in out, out
+    print(f"budget ok: scheduled plan is {plan['planned']:.0f} calls a day for 2 trips at measured pagination")
 
     # -- prune runs at the end of --sweep and --once --------------------------
     for label, runner in (("sweep", run_sweep), ("once", run_focus)):
@@ -1822,38 +2181,25 @@ def self_test() -> None:
             Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, stale, stale),
             Leg("s", "delta", "JFK", "SYD", "2027-03-02", "Y", 30000, 66.0, 4, "DL", False, now, now),
         ])
-        pst.set_state("focus_dates", ["2027-03-14"])
+        pst.set_state("focus_windows", [{"trip": "australia", "date": "2027-03-14"},
+                                        {"trip": "gone", "date": "2027-03-14"}])
         pcl = SeatsAero(cfg, pst, api_key="test-key")
         pcl.session = _FakeSession([_FakeResponse({"data": [], "hasMore": False})], repeat_last=True)
         with redirect_stdout(io.StringIO()):
             runner(cfg, pst, pcl, True)
         left = pst.conn.execute("SELECT observed_at FROM observations").fetchall()
         assert [r[0] for r in left] == [now], f"{label} kept {left}"
-        assert pst.calls_today() == (20 if label == "sweep" else 2), pst.calls_today()
-    print("prune ok: --sweep and --once both drop rows past retention and keep the rest")
-
-    # -- leaderboard fenced for a job summary ---------------------------------
-    os.environ["GITHUB_ACTIONS"] = "true"
-    try:
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            show_best(cfg, store, cabin="Y")
-    finally:
-        del os.environ["GITHUB_ACTIONS"]
-    lines = buf.getvalue().strip().splitlines()
-    assert lines[0] == "```" and lines[-1] == "```", lines[:2]
-    print("summary ok: --best fences its table under GitHub Actions")
+        assert pst.calls_today() == (40 if label == "sweep" else 2), (label, pst.calls_today())
+    print("prune ok: --sweep covers every trip, --once skips windows for unknown trips, both prune")
 
     # -- calibration --------------------------------------------------------
     cals = calibrate(cfg, store)
     assert all(c.refusal for c in cals.values()), "thin history must be refused"
-    assert "200 viable combinations" in cals["Y"].refusal and "14 days" in cals["Y"].refusal
-    assert cals["F"].combos == 1
-
+    assert "200 viable combinations" in cals[("australia", "Y")].refusal
     hist = Store(":memory:")
     old = (now_dt - timedelta(days=20)).isoformat()
-    synthetic: list[Leg] = []
     for stamp in (old, now):
+        synthetic = []
         for i in range(20):
             out_day = (date(2027, 3, 1) + timedelta(days=i)).isoformat()
             synthetic.append(Leg("s", "delta", "JFK", "SYD", out_day, "Y", 27000 + 700 * i,
@@ -1863,22 +2209,25 @@ def self_test() -> None:
             synthetic.append(Leg("s", "delta", "SYD", "JFK", back_day, "Y", 27000 + 500 * i,
                                  66.0, 4, "DL", False, stamp, stamp))
         hist.record_legs(synthetic)
-        synthetic.clear()
-    cal = calibrate(cfg, hist)["Y"]
+    cal = calibrate(cfg, hist)[("australia", "Y")]
     assert cal.refusal is None, cal.refusal
-    assert cal.combos >= CALIBRATE_MIN_COMBOS and cal.span_days >= CALIBRATE_MIN_DAYS, cal
     assert cal.p10 > 40300, "percentile computed over single legs, not round trip totals"
     assert cal.floor == round_to(cal.p10, 5000) and cal.ceiling == round_to(cal.median, 5000)
     assert cal.floor < cal.ceiling and 55000 <= cal.floor <= 70000, cal
     assert percentile([1, 2, 3, 4], 50) == 2.5 and percentile([10], 90) == 10.0
     assert round_to(58600, 5000) == 60000 and round_to(57400, 5000) == 55000
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        show_calibrate(cfg, hist)
-    out = buf.getvalue()
-    assert f"floor_miles: {cal.floor}" in out and "refused, need" in out, out
-    print(f"calibrate ok: refuses thin history, proposes Y floor {cal.floor:,} "
+    out = _quiet(show_calibrate, cfg, hist)
+    assert f"floor_miles: {cal.floor}" in out and "refused, need" in out and "  australia:\n    cabins:\n      Y:" in out, out
+    print(f"calibrate ok: refuses thin history, proposes Australia Y floor {cal.floor:,} "
           f"ceiling {cal.ceiling:,} from {cal.combos} combos over {cal.span_days:.0f} days")
+
+    # -- typical best from snapshots -----------------------------------------
+    for i in range(16):
+        hist.record_snapshot((now_dt - timedelta(days=15 - i)).isoformat(), "australia", "Y",
+                             60000 + (i % 4) * 1000, 100, 0)
+    assert hist.typical_best("australia", "Y") == 61500.0
+    assert hist.typical_best("mexico", "Y") is None
+    print("typical ok: median of three weeks of snapshots, none under fourteen days")
 
     print("\nAll self-tests passed.")
 
@@ -1890,21 +2239,24 @@ def self_test() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="seats.aero open-date award monitor, four cabin views. "
+        description="seats.aero open-date award monitor, several trips, four cabin views. "
                     "Add --dry-run to print alerts instead of sending them.")
     ap.add_argument("--config", default="config.yaml", help="path to config, default config.yaml")
     modes = ap.add_argument_group("modes")
     modes.add_argument("--once", action="store_true", help="one focus poll")
-    modes.add_argument("--sweep", action="store_true", help="one full calendar sweep")
+    modes.add_argument("--sweep", action="store_true", help="one full calendar sweep, every trip")
     modes.add_argument("--loop", action="store_true", help="scheduler, sweep then focus polls")
     modes.add_argument("--probe", action="store_true", help="one live call, dump the raw response")
-    modes.add_argument("--best", action="store_true", help="leaderboards, one per cabin")
+    modes.add_argument("--best", action="store_true", help="overview, then leaderboards per trip and cabin")
+    modes.add_argument("--overview", action="store_true", help="where to go right now, one table")
     modes.add_argument("--calibrate", action="store_true", help="propose thresholds from history")
+    modes.add_argument("--export", metavar="FILE", help="write the dashboard data file")
     modes.add_argument("--stats", action="store_true", help="observation history summary")
     modes.add_argument("--budget", action="store_true", help="API call plan and measured usage")
     modes.add_argument("--self-test", action="store_true", help="offline test, no network")
     modes.add_argument("--test-alert", action="store_true", help="send one Pushover message")
     opts = ap.add_argument_group("options")
+    opts.add_argument("--trip", help="--best for one trip key only")
     opts.add_argument("--cabin", choices=CABIN_ORDER, help="--best for one cabin only")
     opts.add_argument("--limit", type=int, default=15, help="--best rows per section, default 15")
     opts.add_argument("--dry-run", action="store_true", help="print alerts instead of sending")
@@ -1928,10 +2280,16 @@ def main() -> None:
     store = Store(cfg["storage"]["db_path"])
 
     if args.best:
-        show_best(cfg, store, limit=args.limit, cabin=args.cabin)
+        show_best(cfg, store, limit=args.limit, trip_key=args.trip, cabin=args.cabin)
+        return
+    if args.overview:
+        show_overview(cfg, store)
         return
     if args.calibrate:
         show_calibrate(cfg, store)
+        return
+    if args.export:
+        export_dashboard(cfg, store, args.export)
         return
     if args.stats:
         show_stats(cfg, store)
@@ -1941,7 +2299,7 @@ def main() -> None:
         return
     if args.test_alert:
         print("sent" if send_pushover(cfg["pushover"], "Award monitor online",
-                                      "Watching the whole calendar, JFK to SYD.", 0) else "failed")
+                                      "Watching the whole calendar for every trip.", 0) else "failed")
         return
 
     client = SeatsAero(cfg, store)

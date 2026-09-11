@@ -1,11 +1,10 @@
 # Award Monitor
 
-Scans the whole bookable calendar for a JFK to SYD round trip that four of you
-can book together, ranks every legal date combination by miles, and alerts on
-Pushover when a new best appears or anything drops under your floor. There is
-one leaderboard per cabin. Economy, premium economy, business and first each
-carry their own thresholds and their own running best, so a cheap economy print
-never hides a business one.
+Scans the whole bookable calendar for award round trips that four of you can
+book together, from the New York area to Australia, Mexico, Europe and Asia.
+Ranks every legal date combination by miles, per trip and per cabin, alerts on
+Pushover when a price crosses a threshold, and feeds a live dashboard so you
+can watch the market yourself. Runs on GitHub Actions, no server.
 
 ## The benchmark
 
@@ -21,15 +20,13 @@ From the April 2026 award receipt, confirmation GYLTUY, ticketed 6 Nov 2025:
 | Booked | 139 days before departure |
 | Fare | Delta Main Basic (N), fare basis ESVR331/FFX15 |
 
-Two things follow. You booked roughly four and a half months out, so the
-monitor's horizon runs 45 to 331 days forward and covers that zone comfortably.
-And you flew Basic Economy, which the receipt confirms is non-changeable and
-almost always non-refundable once the 24 hour risk-free window closes. Book
-fast, but check the fare brand on delta.com before you confirm. The monitor puts
-that reminder in every alert.
+You booked roughly four and a half months out, so the horizon runs 45 to 331
+days forward. You flew Basic Economy, which is non-changeable and almost always
+non-refundable once the 24 hour window closes. Every alert carries a reminder
+to check the fare brand before confirming.
 
-Only economy has a verified benchmark. The other three cabins show a blank in
-the `vs bench` column until you have paid for one.
+Only Australia economy has a verified benchmark. Every other trip and cabin
+shows a blank in the `vs bench` column until you have paid for one.
 
 ## Setup
 
@@ -47,130 +44,121 @@ python monitor.py --probe         # one live call, reconciles the parser
 python monitor.py --sweep --dry-run --verbose   # first real scan
 ```
 
-## First live run
+## Trips
 
-The parser was reconciled against a live response on 11 Sep 2026 by `--probe`,
-which makes exactly one call and prints the raw object, every response header
-and a field by field table. What it confirmed:
+`config.yaml` has one block per trip. A trip is a set of destination airports,
+a stay length, and its own price thresholds per cabin. Home airports are
+shared and listed once under `origins`.
 
-- Field names. `ID`, `Route.OriginAirport`, `Source`, `Date`, `UpdatedAt`,
-  `TaxesCurrency`, and per cabin `Available`, `MileageCost` as a string of
-  digits, `RemainingSeats`, `TotalTaxes`, `Airlines`, `Direct`. There is no
-  `ComputedLastSeen`. Every cabin field also has a `Raw` twin holding the
-  value before seats.aero's own quality filter. The parser reads the filtered
-  set, which is what the site shows.
-- Tax units. `TotalTaxes` is the minor unit of `TaxesCurrency`. The probe row
-  was a Qantas economy seat on Emirates metal at 40860, which is $408.60 and
-  plausible for that carrier's surcharges. Delta rows should land near $66.
-- Pagination. Responses carry `count`, `hasMore`, `cursor` and a ready-made
-  `moreURL`. The monitor follows `moreURL` and falls back to the cursor plus
-  skip protocol only if it is absent.
-- Quota. `x-ratelimit-remaining` counts down from `x-ratelimit-limit: 1000`.
-  `--budget` shows the remaining figure from the last call.
-- The cabin filter is the `cabins` parameter with word values
-  (`economy,premium,business,first`).
+```yaml
+origins: [JFK, EWR, LGA, BOS, IAD, PHL]
 
-Run `--probe` again after any parser change. It costs one call.
-
-## How it scans
-
-Two modes share one budget.
-
-**Sweep** walks the full horizon in 31 day windows, both directions, every six
-hours. Ten windows, two calls each, four times a day is 80 calls before
-pagination.
-
-**Focus** re-polls only the months around each cabin's best combination every
-15 minutes. Three windows, two calls each is 552 calls before pagination. Focus
-windows go to the top date of each cabin first, in the order Y, W, J, F, then
-fill by global rank. With four cabins and three windows the fourth cabin only
-gets one when another cabin has nothing.
-
-Adding cabins does not add calls, since cabin is a parameter on the same query.
-It does add rows, which adds pages, which adds calls. Every sweep records how
-many calls each window actually took and `--budget` multiplies the plan by that
-measured figure rather than assuming one page per direction.
-
-```bash
-python monitor.py --loop
+trips:
+  australia:
+    label: "Australia"
+    destinations: [SYD, MEL, BNE]
+    min_trip_nights: 10
+    max_trip_nights: 35
+    cabins:
+      Y: {benchmark_miles: 66200, floor_miles: 60000, ceiling_miles: 72000}
+  mexico:
+    destinations: [MEX, SJD, LAP]
+    min_trip_nights: 5
+    max_trip_nights: 14
 ```
 
-The scheduler decides each tick whether a sweep is due and runs a focus poll
-otherwise.
+Cabin defaults, the programs to query, tax caps, seat rules and Pushover
+priority, live once under `cabins` and apply to every trip. A trip's own
+`cabins` block overrides any of them. Prices are only ever per trip, because
+Mexico and Sydney are not on the same scale, and validation refuses a price on
+the global block.
+
+- `floor_miles` and `ceiling_miles` are set together or left null together.
+  Null means observe-only. The cabin is scanned, stored, ranked and shown on
+  the dashboard, it just never alerts. Everything but Australia economy ships
+  this way until `--calibrate` has history.
+- `min_seats` is the one permitted loosening of the four seat rule. First
+  class carries 2 because four first class seats together is a fantasy.
+- A destination belongs to exactly one trip and can't also be an origin.
+- Each trip is its own API query, so four trips cost four times the calls of
+  one. Run `--budget` after adding one.
+
+## Seats
+
+Four seats on one booking is the binding constraint, and some programs never
+publish a seat count. The monitor keeps those rows but never lets a maybe read
+as a yes.
+
+- A row whose count is published and at least `min_seats` is confirmed.
+- A row whose program publishes no count is kept, shown as `?` in every table,
+  counted in every section footer, and its alert title ends in
+  `seats unconfirmed` with a line in the body saying the four seats are not
+  confirmed. The dashboard shows an amber pill.
+- A row whose published count is below `min_seats` is dropped. It can't be
+  booked for the party.
+
+The first live sweep showed Alaska and Qantas publishing a count on every row
+and American publishing none. `alerting.require_seat_count: true` drops
+unpublished rows everywhere instead of flagging them.
+
+## Where to go right now
+
+```bash
+python monitor.py --overview
+```
+
+One table. A row per trip, a column per cabin, the cheapest viable round trip
+per person with a `?` when the seats are not confirmed, and once there are
+three weeks of history, the gap against the recent typical best. A closing line
+names the cheapest trip per cabin. This is the "should we go somewhere else
+instead" view. The same table heads `--best` and the dashboard.
 
 ## Choosing dates by price
 
 ```bash
-python monitor.py --best              # all four cabins, in order Y W J F
-python monitor.py --best --cabin J    # one cabin
-python monitor.py --best --limit 40   # rows per section, default 15
+python monitor.py --best                                 # overview, then every trip and cabin
+python monitor.py --best --trip asia                     # one trip
+python monitor.py --best --trip australia --cabin J      # one trip and cabin
+python monitor.py --best --limit 40                      # rows per section, default 15
 ```
 
 Every viable combination ranked by total miles per person, one section per
-enabled cabin. This is the deliverable. You pick dates off whichever table you
-are shopping rather than picking dates and hoping.
+trip and cabin, in the order Y W J F. You pick dates off whichever table you
+are shopping.
 
 ```
+=== AUSTRALIA  SYD/MEL/BNE, 10 to 35 nights
+
 ECONOMY  benchmark 66,200 per person
 seats for 4, taxes under $400  |  alerts at or under 60,000, on a new best by 3,000, never above 72,000
 out         back         nts route     prog              miles  vs bench  seats      party
 ------------------------------------------------------------------------------------------
 2027-03-14  2027-04-05    22 JFK-SYD   delta            54,000   +12,200      4    216,000
-2027-02-10  2027-03-04    22 JFK-SYD   delta            66,200        +0      4    264,800
-  2 of 2 viable combinations, 1 beat the benchmark
-
-BUSINESS  no benchmark, observe-only
-seats for 4, taxes under $800  |  no alerts until thresholds are set, run --calibrate
-out         back         nts route     prog              miles  vs bench  seats      party
-------------------------------------------------------------------------------------------
-2027-05-02  2027-05-24    22 JFK-SYD   delta           285,000         -      4  1,140,000
-  1 of 1 viable combinations
+2026-10-27  2026-11-17    21 JFK-SYD   american         60,000    +6,200      ?    240,000
+  2 of 2 viable combinations, 2 beat the benchmark, 1 with no published seat count (shown as ?)
 ```
 
 Every enabled section prints, even when empty. An empty section says
-`no availability recorded`, or how many legs were seen and why none paired,
-and that is useful signal. `vs bench` shows `-` when the cabin has no
-benchmark. `seats` shows `?` when the program publishes no count. `party` is
-the per person figure times `party_size`, because 285,000 each reads very
-differently at four passengers.
+`no availability recorded`, or how many legs were seen and why none paired.
+`party` is the per person figure times `party_size`, because 285,000 each
+reads very differently at four passengers.
 
-## Cabin config
+## The dashboard
 
-Each cabin is one block under `cabins` in `config.yaml`. Only `sources` is
-required. Everything else has a default.
+Every scheduled run writes `dashboard.json` to the `monitor-state` branch
+next to the database. The dashboard is a published claude.ai page that reads
+that file through your GitHub connector and refreshes itself every minute, so
+it is at most one poll behind the market. It shows the overview as cards, a
+tab per trip with the four cabin leaderboards, a sparkline of each cabin's
+best price over the last 45 days, and a seat pill on every row.
 
-```yaml
-cabins:
-  Y:
-    label: "Economy"
-    enabled: true
-    sources: [delta, virginatlantic, qantas, ...]
-    benchmark_miles: 66200        # null prints a blank vs bench column
-    floor_miles: 60000            # at or under this always alerts
-    ceiling_miles: 72000          # above this never alerts
-    new_best_margin_miles: 3000   # also alert on a new cabin best by this much
-    max_total_taxes_usd: 400
-    min_seats: 4                  # defaults to trip.party_size
-    pushover_priority: 1          # -2 to 2, 1 bypasses quiet hours
+The page needs the GitHub connector in claude.ai Settings > Connectors. Without
+it the page still renders the snapshot it was published with and says how to
+make it live.
+
+```bash
+python monitor.py --export dashboard.json   # what the workflows run
 ```
-
-- `sources` is per cabin because first class on this route is partner metal
-  and querying Delta for it wastes response size. One API call carries the
-  union of every enabled cabin's sources, then each cabin ranks only its own.
-- `floor_miles` and `ceiling_miles` are set together or left null together.
-  Null means observe-only. The cabin is still scanned, stored and ranked, it
-  just never alerts. W, J and F ship this way until `--calibrate` has history.
-- `min_seats` is the one permitted loosening of the four seat rule. First
-  class carries 2 because four first class seats together is a fantasy.
-- `trip.allow_mixed_cabin: false` keeps every pairing in one cabin both ways.
-  An outbound in business and a return in economy is not a business
-  redemption. When true, a mixed pairing ranks under its lower cabin and
-  `--best` adds a `cabins` column.
-
-Config validation fails loudly on an unknown cabin code, a floor above a
-ceiling, one threshold set without the other, `min_seats` above `party_size`,
-and on any key left over from the old single-threshold layout, naming where it
-moved.
 
 ## Calibrating thresholds
 
@@ -178,85 +166,55 @@ moved.
 python monitor.py --calibrate
 ```
 
-Nobody knows what a good business price on this route looks like yet, and the
-monitor will not invent one. For each enabled cabin it takes every viable round
-trip total from the whole retained history, latest price per leg, and reports
-the count of combinations, the date span, min, 10th percentile, median and 90th
-percentile. It proposes `floor_miles` at the 10th percentile and
-`ceiling_miles` at the median, both rounded to the nearest 5,000, and prints a
-YAML block to paste.
+For each trip and cabin, from every viable round trip total in the whole
+retained history, latest price per leg, it reports the count of combinations,
+the date span, min, 10th percentile, median and 90th percentile. It proposes
+`floor_miles` at the 10th percentile and `ceiling_miles` at the median, both
+rounded to the nearest 5,000, and prints a YAML block to paste under `trips`.
 
 It refuses to propose on fewer than 200 viable combinations or less than 14
 days of history and says which. Nothing is written to `config.yaml`
 automatically.
 
-Sanity check. With real economy history the proposed Y floor should land near
-60,000. If it lands near 30,000, percentiles are being computed over single
-legs rather than round trip totals.
-
 ## Alert rules
 
-Price gates live per cabin, plumbing lives under `alerting`.
+Price gates live per trip and cabin, plumbing lives under `alerting`.
 
 - `floor_miles` fires unconditionally. Anything at or under wakes you.
-- `new_best_margin_miles` fires when a fresh cabin best beats the standing best
-  by that much.
+- `new_best_margin_miles` fires when a fresh best for that trip and cabin
+  beats the standing best by that much.
 - `ceiling_miles` suppresses everything worse, however good the trend.
 
-Each cabin sorts ascending and walks with its own running best, stored as
-`best_total_miles:<cabin>`, so a cold start alerts on each cabin's winner rather
-than the whole leaderboard, and a cheap economy pairing cannot suppress a
-business alert. The same pairing repeats only if it improves by
-`improvement_threshold_miles` or the cooldown expires. The dedupe key is built
-from both legs' fingerprints, which carry the cabin, so the same dates in a
-different cabin are a different alert.
+Each trip and cabin sorts ascending and walks with its own running best,
+stored as `best_total_miles:<trip>:<cabin>`, so a cold start alerts on each
+list's winner and a cheap Mexico economy pairing can't suppress a Sydney
+business one.
 
-Each cabin sends at most one message per pass. The cheapest qualifying
-pairing is written out in full and every other qualifying pairing gets one
-line, so twenty return dates at one price arrive as one message titled
-`60k ECONOMY AMERICAN JFK-SYD +19 more` rather than twenty messages. Each
-pairing inside the digest is still deduped on its own.
+Each list sends at most one message per pass. The cheapest qualifying pairing
+is written out in full and every other qualifying pairing gets one line, so
+twenty return dates at one price arrive as one message titled
+`60k AUSTRALIA ECONOMY AMERICAN JFK-SYD, seats unconfirmed +19 more`. Each
+pairing inside the digest is still deduped on its own and repeats only if it
+improves by `improvement_threshold_miles` or the cooldown expires.
 
-Alert titles carry the cabin, for example `285k BUSINESS DELTA JFK-SYD`.
-Pushover priority comes from the cabin, so an economy floor hit can wake you at
-3am while a business observation waits until morning. Every alert carries the
-party total, the benchmark comparison when the cabin has one, and the fare brand
-reminder.
+Pushover priority comes from the cabin, so an economy floor hit can wake you
+at 3am while a business observation waits until morning.
 
-## Search breadth
+## How it scans
 
-Six departure airports and three Australian arrivals go in the same
-comma-separated query, so widening costs nothing extra in API calls. Trip length
-runs 10 to 35 nights, which covers your 22 night pattern with room either side.
-`require_same_source: true` keeps both legs in one program, since splitting
-across two programs means holding two mileage currencies.
+Two modes share one budget.
 
-## Known limits
+**Sweep** walks the full horizon in 31 day windows, every trip, both
+directions. Ten date ranges times four trips is 40 windows, two calls each,
+four times a day.
 
-**Fare brand is invisible.** seats.aero returns a mileage price, not a Delta
-fare family. The 66,200 you paid was Main Basic. A price the monitor surfaces
-could be Basic or Main, and you won't know until you're on delta.com. Given the
-refund rules, that check is worth the thirty seconds.
+**Focus** re-polls the months around the best combinations. Every trip's
+economy top first, then every trip's premium top, and so on, capped at
+`max_focus_windows`, every 30 minutes on the schedule.
 
-**Cached data only.** Pro accounts don't get Live Search, so your true latency
-is seats.aero's crawl rather than your poll interval. Rows older than
-`max_data_age_hours` get dropped before alerting. The leaderboard uses a window
-24 times wider so it survives a quiet day.
-
-**Seat counts.** Some programs never publish them and return zero. The default
-alerts anyway and labels the row `?`. The first live sweep showed Alaska and
-Qantas publishing a count on every row and American publishing none. Flip
-`require_seat_count` to true to drop unverifiable rows from the leaderboard and
-the alerts.
-
-**Four seats stays the constraint.** A cheap print usually surfaces with one or
-two. The leaderboard shows the binding seat count per row so you can see whether
-a headline number is real for a party of four.
-
-**Taxes are compared in the currency seats.aero reports.** The monitor stores
-`TaxesCurrency` with every observation. If a program reports in something other
-than USD, the `max_total_taxes_usd` cap is comparing unlike units for that
-program. `--stats` will show you which programs are in play.
+Every sweep records how many calls each window actually took and `--budget`
+multiplies the plan by that measured figure. Four trips plan at 704 of 900
+usable calls a day before pagination.
 
 ## Hosting on GitHub Actions
 
@@ -267,22 +225,40 @@ program. `--stats` will show you which programs are in play.
 - `focus-poll.yml` runs `--once` at :07 and :37 every hour.
 - `full-sweep.yml` runs `--sweep` at :17 every six hours.
 
-The database lives on an orphan branch called `monitor-state`. Each run
-restores it, works, then force-pushes it back. A run refuses to start on a
-blank database if that branch exists but can't be read, so a transient git
-error can't wipe the price history. Both scheduled workflows share one
-concurrency group so they never write state at the same time, and a separate
-job sends a Pushover message if a run fails or times out.
+The database and `dashboard.json` live on an orphan branch called
+`monitor-state`. Each run restores them, works, then force-pushes them back. A
+run refuses to start on a blank database if that branch exists but can't be
+read. Both scheduled workflows share one concurrency group, and a separate job
+sends a Pushover message if a run fails or times out. Every run prunes
+observations past `storage.retain_observation_days` on its way out, and
+`--best` fences its output in a code block under Actions so the job summary
+keeps its columns.
 
-Every sweep and focus poll prunes observations past
-`storage.retain_observation_days` on its way out, since scheduled mode never
-enters the loop. `--best` fences its table in a code block when it runs under
-Actions so the job summary keeps its columns.
+## First live run
 
-Schedules only fire from the default branch. `--budget` in scheduled mode
-prices the day as `polls_per_day` focus polls plus `sweeps_per_day` sweeps,
-both mirrored from the crons, times the pagination measured on the last sweep.
-Credentials live in repository secrets, never in the repo.
+The parser was reconciled against a live response on 11 Sep 2026 by `--probe`.
+Field names, tax units (minor unit of `TaxesCurrency`), pagination (`cursor`
+plus a ready-made `moreURL`), the `x-ratelimit-remaining` quota header and
+the `cabins` filter with word values are all confirmed. Run `--probe` again
+after any parser change. It costs one call.
+
+## Known limits
+
+**Fare brand is invisible.** seats.aero returns a mileage price, not a fare
+family. A price the monitor surfaces could be Basic or Main, and you won't know
+until you're on the airline's site.
+
+**Cached data only.** Pro accounts don't get Live Search, so your true latency
+is seats.aero's crawl rather than the poll interval.
+
+**Source coverage.** The first sweep returned rows from Qantas, Alaska and
+American only. Delta, Virgin Atlantic, United and Aeroplan returned nothing for
+Australia. Virgin Australia's program is Velocity, so both `virginaustralia`
+and `velocity` are listed until a sweep says which id returns rows. Unknown
+source ids are ignored by the API, not rejected.
+
+**Taxes are compared in the currency seats.aero reports.** `TaxesCurrency` is
+stored with every observation. `--stats` shows which programs are in play.
 
 ## systemd
 
