@@ -53,7 +53,8 @@ dashboard export, calibration, self test, main.
   `--overview`, `--best` and the dashboard. `Store.typical_best` is the
   median of three weeks of snapshots, null under fourteen days.
 - `dashboard_data` and `--export` write the JSON the dashboard reads.
-  `compact_history` keeps the file small.
+  `compact_history` keeps the file small. `calendar_data` is the per-day
+  layer, shared by `--calendar` and the dashboard grid.
 - `budget_plan` prices a window as one trip and one date range, two
   directions, times the measured pagination.
 - `scan.mode` is `loop` or `scheduled`. Scheduled mode is GitHub Actions on
@@ -111,7 +112,7 @@ constant and the self test asserts it appears.
 **API budget is 1,000 calls a day, hard.** Run `--budget` after any change to
 `horizon`, `scan`, `cabins` or `trips`. Adding a cabin adds no calls but adds
 rows, which adds pages. Adding a trip adds a full set of calls. Four trips
-plan at 704 of 900 before pagination. Every sweep measures calls per window and `--budget`
+plan at 736 of 900 before pagination with the 360 day horizon. Every sweep measures calls per window and `--budget`
 multiplies by that. If it climbs past about 2.5, lower `chunk_days` or raise
 `focus_interval_minutes`. `budget_safety_margin` exists so a manual `--once`
 never trips the cap.

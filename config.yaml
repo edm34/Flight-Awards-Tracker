@@ -22,7 +22,9 @@ horizon:
   # Airlines load schedules roughly 331 days out. Start far enough forward
   # that award inventory exists. Lower min_days_out for a last-minute deal.
   min_days_out: 45
-  max_days_out: 331
+  # 360 so the calendar view reaches twelve months out. Most programs load
+  # inventory 331 to 355 days ahead, the last window is often thin.
+  max_days_out: 360
   # Each API call covers this many days for one trip. Smaller means more
   # calls but less pagination per call. --budget shows the measured figure.
   chunk_days: 31

@@ -1439,6 +1439,61 @@ def show_overview(cfg: dict, store: Store) -> None:
     print_overview(cfg, store, rank_all(cfg, legs))
 
 
+def show_calendar(cfg: dict, store: Store, trip_key: str | None, cabin: str | None,
+                  direction: str = "out") -> None:
+    """Twelve months of departure (or return) days for one trip and cabin.
+    Each cell is the cheapest viable round trip in thousands of miles per
+    person, with ? when the seats are not confirmed, a dot when a one-way leg
+    exists but nothing pairs, and blank outside the scanned horizon."""
+    trips = enabled_trips(cfg)
+    trip = next((t for t in trips if t["key"] == trip_key), trips[0]) if trip_key else trips[0]
+    if trip_key and trip["key"] != trip_key:
+        raise SystemExit(f"--trip {trip_key} is not an enabled trip. Enabled: "
+                         + ", ".join(t["key"] for t in trips))
+    code = cabin or "Y"
+    c = trip["cabins"].get(code)
+    if c is None or not c["enabled"]:
+        raise SystemExit(f"--cabin {code} is not enabled for {trip['key']}")
+    legs = store.latest_legs(cfg["alerting"]["max_data_age_hours"] * 24)
+    rows = rank_all(cfg, legs)[trip["key"]][code]
+    cal = calendar_data(cfg, trip, c, rows, legs)
+    best = {r[0]: r for r in cal[direction]}
+    oneway = {r[0] for r in cal["legs_" + direction]}
+    chunks = horizon_chunks(cfg)
+    lo, hi = chunks[0][0], chunks[-1][1]
+
+    what = "departure" if direction == "out" else "return"
+    print(f"\n{trip['label'].upper()} {c['label'].upper()}  cheapest viable round trip by {what} day, "
+          f"thousands of miles per person, party of {cfg['party_size']}")
+    print(f"? seats not confirmed   . one-way leg only, nothing pairs   blank outside {lo} to {hi}\n")
+    today = datetime.now(timezone.utc).date().replace(day=1)
+    month = today
+    for _ in range(12):
+        nxt = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+        print(f"{month.strftime('%B %Y'):20}  Mo   Tu   We   Th   Fr   Sa   Su")
+        line = " " * 22 + "     " * month.weekday()
+        d = month
+        while d < nxt:
+            iso = d.isoformat()
+            if iso < lo or iso > hi:
+                cell = "  "
+            elif iso in best:
+                cell = f"{best[iso][1] // 1000:>2}{'?' if best[iso][2] != 'confirmed' else ' '}"
+            elif iso in oneway:
+                cell = " ."
+            else:
+                cell = "  "
+            line += f"{cell:>4} "
+            if d.weekday() == 6:
+                print(line)
+                line = " " * 22
+            d += timedelta(days=1)
+        if line.strip():
+            print(line)
+        print()
+        month = nxt
+
+
 def show_stats(cfg: dict, store: Store) -> None:
     rows = store.conn.execute(
         """SELECT cabin, source, origin, destination, COUNT(*) AS n,
@@ -1584,6 +1639,41 @@ def compact_history(rows: list, now: datetime) -> list[dict]:
     return [by_day[d] for d in sorted(by_day)] + out
 
 
+def calendar_data(cfg: dict, trip: dict, c: dict, rows: list[tuple[RoundTrip, str]],
+                  legs: list[Leg]) -> dict:
+    """Per day, the cheapest viable round trip that departs that day and the
+    cheapest that returns that day, plus the cheapest one-way leg per day in
+    each direction. rows is ascending, so the first pairing seen for a date
+    is that date's cheapest. Lists of lists to keep the file small."""
+    out_best: dict[str, list] = {}
+    back_best: dict[str, list] = {}
+    for rt, _ in rows:
+        status = seat_status(rt, c["min_seats"])[0]
+        d = rt.outbound.depart_date
+        if d not in out_best:
+            out_best[d] = [d, rt.total_miles, status, rt.inbound.depart_date, rt.outbound.source]
+        d = rt.inbound.depart_date
+        if d not in back_best:
+            back_best[d] = [d, rt.total_miles, status, rt.outbound.depart_date, rt.outbound.source]
+    legs_out: dict[str, list] = {}
+    legs_back: dict[str, list] = {}
+    origins, dests = set(cfg["origins"]), set(trip["destinations"])
+    for l in legs:
+        if l.cabin != c["code"] or l.source not in c["sources"]:
+            continue
+        if l.origin in origins and l.destination in dests:
+            target = legs_out
+        elif l.origin in dests and l.destination in origins:
+            target = legs_back
+        else:
+            continue
+        cur = target.get(l.depart_date)
+        if cur is None or l.miles < cur[1]:
+            target[l.depart_date] = [l.depart_date, l.miles, l.seats, l.source]
+    return {"out": sorted(out_best.values()), "back": sorted(back_best.values()),
+            "legs_out": sorted(legs_out.values()), "legs_back": sorted(legs_back.values())}
+
+
 def dashboard_data(cfg: dict, store: Store) -> dict:
     """Everything the dashboard shows, as plain JSON. Same ranking as --best."""
     party, alert_cfg = cfg["party_size"], cfg["alerting"]
@@ -1627,6 +1717,7 @@ def dashboard_data(cfg: dict, store: Store) -> dict:
                                          if seat_status(rt, c["min_seats"])[0] != "confirmed"),
                 "best": rows[0][0].total_miles if rows else None,
                 "typical": typical, "rows": rows_out, "history": history,
+                "calendar": calendar_data(cfg, trip, c, rows, legs),
             })
         trips_out.append({
             "key": trip["key"], "label": trip["label"],
@@ -1636,8 +1727,10 @@ def dashboard_data(cfg: dict, store: Store) -> dict:
         })
 
     last_sweep = store.get_state("last_sweep")
+    chunks = horizon_chunks(cfg)
     return {
         "generated_at": now.isoformat(),
+        "horizon": {"from": chunks[0][0], "to": chunks[-1][1]},
         "party_size": party, "origins": cfg["origins"],
         "data_age_days": age_hours // 24,
         "last_sweep": last_sweep,
@@ -2122,8 +2215,23 @@ def self_test() -> None:
     compact = compact_history(old_rows, now_dt)
     assert len(compact) == 2 and compact[0]["best"] == 69500 and compact[1]["best"] == 54000, compact
     assert data["overview"][0]["key"] == "mexico" and data["budget"]["cap"] == 900
+    cal = au_y["calendar"]
+    assert cal["out"] == [["2027-02-10", 66200, "confirmed", "2027-03-04", "delta"],
+                          ["2027-03-14", 54000, "confirmed", "2027-04-05", "delta"]], cal["out"]
+    assert cal["back"][0] == ["2027-03-04", 66200, "confirmed", "2027-02-10", "delta"]
+    assert ["2027-03-16", 20000, 2, "delta"] in cal["legs_back"], "one-way legs include the 2 seat return"
+    assert all(r[0].startswith("2027-0") for r in cal["legs_out"]) and len(cal["legs_out"]) == 2
+    mx_cal = mx_y["calendar"]
+    assert mx_cal["out"][0] == ["2027-01-10", 18000, "unpublished", "2027-01-17", "delta"]
+    assert data["horizon"]["from"] < data["horizon"]["to"]
     json.dumps(data)
-    print("export ok: dashboard data carries trips, seat status, history and the overview")
+    print("export ok: dashboard data carries trips, seat status, history, calendar and the overview")
+    out = _quiet(show_calendar, cfg, store, "australia", "Y")
+    assert "AUSTRALIA ECONOMY  cheapest viable round trip by departure day" in out
+    assert "March 2027" in out and "Mo   Tu" in out
+    out = _quiet(show_calendar, cfg, store, "mexico", "Y", "back")
+    assert "by return day" in out and "18?" in out, out
+    print("calendar ok: twelve months per trip and cabin, both directions")
 
     # -- pagination protocol ------------------------------------------------
     client = SeatsAero(cfg, store, api_key="test-key")
@@ -2249,6 +2357,7 @@ def main() -> None:
     modes.add_argument("--probe", action="store_true", help="one live call, dump the raw response")
     modes.add_argument("--best", action="store_true", help="overview, then leaderboards per trip and cabin")
     modes.add_argument("--overview", action="store_true", help="where to go right now, one table")
+    modes.add_argument("--calendar", action="store_true", help="twelve months of days for one trip and cabin")
     modes.add_argument("--calibrate", action="store_true", help="propose thresholds from history")
     modes.add_argument("--export", metavar="FILE", help="write the dashboard data file")
     modes.add_argument("--stats", action="store_true", help="observation history summary")
@@ -2259,6 +2368,7 @@ def main() -> None:
     opts.add_argument("--trip", help="--best for one trip key only")
     opts.add_argument("--cabin", choices=CABIN_ORDER, help="--best for one cabin only")
     opts.add_argument("--limit", type=int, default=15, help="--best rows per section, default 15")
+    opts.add_argument("--returns", action="store_true", help="--calendar by return day instead of departure day")
     opts.add_argument("--dry-run", action="store_true", help="print alerts instead of sending")
     opts.add_argument("--verbose", action="store_true", help="debug logging, logs one raw row per call")
     args = ap.parse_args()
@@ -2284,6 +2394,9 @@ def main() -> None:
         return
     if args.overview:
         show_overview(cfg, store)
+        return
+    if args.calendar:
+        show_calendar(cfg, store, args.trip, args.cabin, "back" if args.returns else "out")
         return
     if args.calibrate:
         show_calibrate(cfg, store)
