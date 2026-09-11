@@ -9,7 +9,7 @@ live dashboard. See @README.md for setup and operating instructions.
 
 Beat 66,200 miles per person round trip in economy. That is what Eric paid in
 April 2026, not the 60,000 he remembers. Source is the Delta award receipt,
-confirmation GYLTUY, ticket 0062378205056, issued 6 Nov 2025.
+issued 6 Nov 2025. The confirmation and ticket numbers stay off this public repo.
 
 - 66,200 miles plus $132.53 per person, 264,800 miles for four
 - Out Wed 25 Mar 2026, DL771 JFK-LAX, DL41 LAX-SYD

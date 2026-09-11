@@ -8,7 +8,7 @@ can watch the market yourself. Runs on GitHub Actions, no server.
 
 ## The benchmark
 
-From the April 2026 award receipt, confirmation GYLTUY, ticketed 6 Nov 2025:
+From the April 2026 award receipt, ticketed 6 Nov 2025:
 
 | | |
 |---|---|
