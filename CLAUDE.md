@@ -1,8 +1,9 @@
 # Award Monitor
 
-Personal tool. Monitors seats.aero for a JFK to SYD award redemption for a
-family of four, ranks the whole bookable calendar by miles in four cabin views,
-alerts on Pushover. See @README.md for setup and operating instructions.
+Personal tool. Monitors seats.aero for award redemptions for a family of four
+from the New York area to Australia, Mexico, Europe and Asia. Ranks the whole
+bookable calendar by miles per trip and cabin, alerts on Pushover, feeds a
+live dashboard. See @README.md for setup and operating instructions.
 
 ## The goal
 
@@ -16,9 +17,10 @@ confirmation GYLTUY, ticket 0062378205056, issued 6 Nov 2025.
 - 22 nights, booked 139 days before departure
 - Fare basis ESVR331/FFX15, **Delta Main Basic (N)**
 
-Premium economy, business and first have no benchmark and no thresholds yet.
-They are scanned, stored and ranked, and `--calibrate` proposes thresholds once
-there is enough history. Nobody invents those numbers by hand.
+Every other trip and cabin has no benchmark and no thresholds yet. They are
+scanned, stored, ranked and shown on the dashboard, and `--calibrate` proposes
+thresholds once there is enough history. Nobody invents those numbers by hand.
+Prices are per trip, because Mexico and Sydney are not on the same scale.
 
 Dates are fully open. Eric picks dates off the price leaderboard, not the other
 way round. Do not add fixed-date assumptions.
@@ -27,45 +29,52 @@ way round. Do not add fixed-date assumptions.
 
 One file, `monitor.py`, in this order. Model, config, storage, chunking,
 client, parsing, pairing and ranking, notification, scan cycles, reporting,
-calibration, self test, main.
+dashboard export, calibration, self test, main.
 
-- `validate_config` applies defaults and fails loudly. It rejects the old
-  single-threshold layout by name so a stale config can't run.
-- `rank_by_cabin` is the one place pairings become per-cabin ranked lists. It
-  filters each cabin to its own sources and runs `viable` with that cabin's
-  `min_seats` and tax cap. `evaluate`, `show_best` and `calibrate` all go
-  through it so the three views can't drift apart.
-- `evaluate` walks each cabin's list ascending with a running best stored as
-  `best_total_miles:<cabin>`. Keep it single pass. An earlier version compared
-  every candidate against a stale figure and alerted on the entire leaderboard
-  on cold start. Observe-only cabins still track a best.
-- `choose_focus_dates` takes the top date from each cabin first, then fills by
-  global rank, capped at `scan.max_focus_windows`.
-- `cached_search` returns a `SearchResult` with the calls it used. `run_sweep`
-  aggregates that into the `sweep_stats` state key and `budget_plan` reads it
-  back, so `--budget` reflects measured pagination.
-- `RoundTrip.cabin` is the cabin a trip ranks under. Mixed pairings, only
-  possible when `trip.allow_mixed_cabin` is true, rank under the lower cabin.
-- `scan.mode` is `loop` or `scheduled`. Scheduled mode is GitHub Actions
-  running `--sweep` and `--once` on the crons in `.github/workflows`, with
-  the database kept on the `monitor-state` branch. `budget_plan` prices the
-  day from `polls_per_day` and `sweeps_per_day` in that mode. `run_sweep` and
-  `run_focus` both call `prune_history` on the way out, because scheduled
-  mode never enters the loop.
+- `validate_config` applies defaults and fails loudly. Trips resolve their
+  cabins by merging the global `cabins` defaults with the trip's overrides.
+  A price on the global block, a destination in two trips, a destination
+  that is also an origin, and the old `trip` section are all refused by name.
+- `rank_all` is the one place pairings become per-trip, per-cabin ranked
+  lists. `evaluate`, `show_best`, `calibrate` and `dashboard_data` all go
+  through it so nothing can drift apart.
+- `seat_status` is the one reading of a seat count. confirmed, unpublished
+  or short. Unpublished rows are kept and flagged everywhere, never trusted.
+  Short rows are dropped.
+- `evaluate` walks each trip's each cabin's list ascending with a running
+  best stored as `best_total_miles:<trip>:<cabin>`, collects every
+  qualifying pairing and sends one digest through `format_digest`. The first
+  live sweep sent twenty separate messages for twenty return dates at one
+  price. Don't go back to one message per pairing. It also writes one
+  `snapshots` row per list per pass, which is the dashboard's history.
+- `choose_focus_windows` takes every trip's economy top first, then every
+  trip's premium top, and so on, capped at `scan.max_focus_windows`.
+- `overview_rows` is the "where to go right now" table, shared by
+  `--overview`, `--best` and the dashboard. `Store.typical_best` is the
+  median of three weeks of snapshots, null under fourteen days.
+- `dashboard_data` and `--export` write the JSON the dashboard reads.
+  `compact_history` keeps the file small.
+- `budget_plan` prices a window as one trip and one date range, two
+  directions, times the measured pagination.
+- `scan.mode` is `loop` or `scheduled`. Scheduled mode is GitHub Actions on
+  the crons in `.github/workflows`, state on the `monitor-state` branch.
+  `run_sweep` and `run_focus` both call `prune_history` on the way out.
 - Never commit `.env` or the database. Credentials are repository secrets.
-  The workflow files are Eric's, reviewed outside the repo. Don't rework the
-  restore, save, concurrency or alert-if-down logic without asking.
+  The workflow files are Eric's. The export step and the one line that adds
+  `dashboard.json` to the state commit are the only additions. Don't rework
+  the restore, save, concurrency or alert-if-down logic without asking.
 
 ## What is verified and what is not
 
 Verified offline by `--self-test`, which runs against an in-memory database and
-its own embedded config so it never touches real data. Date chunking, parsing
-of all four cabins, same-cabin pairing and mixed cabin rejection, per-cabin
-seat and tax gates, per-cabin alert gating with null thresholds, per-cabin
-running best, dedupe key carrying the cabin, leaderboard rendering including
-empty sections and `--cabin`, the pagination protocol against a fake session,
-budget arithmetic with measured pagination, and calibration refusal and
-proposal on synthetic history.
+its own embedded two-trip config so it never touches real data. Config
+resolution and nine rejections, date chunking, parsing in the live shape,
+per-trip pairing and mixed cabin rejection, seat status, per-trip per-cabin
+gating and running best, the alert digest, snapshots, the overview and
+leaderboard rendering with filters, the dashboard export and history
+compaction, the pagination protocol against a fake session, budget arithmetic
+for trips and both modes, prune in both scan paths, calibration and the
+typical-best median.
 
 Verified against a live response on 11 Sep 2026 by `--probe`. Field names
 `ID`, `Route.OriginAirport`, `Source`, `Date`, `UpdatedAt`, `TaxesCurrency`,
@@ -78,9 +87,12 @@ The quota header is `x-ratelimit-remaining` against `x-ratelimit-limit`
 1000. The cabin filter is the `cabins` parameter with word values. There is
 no `ComputedLastSeen`.
 
-Still open after one probe page. Which programs return anything in J and F
-for these routes. The first page of Oct to Nov 2026 had Y 25, W 3, J 0, F 0.
-Empty is a finding, not a bug. The first full sweep will say.
+From the first full sweep on 11 Sep 2026, 3,381 legs over the whole horizon.
+Only Qantas, Alaska and American returned rows. Delta, Virgin Atlantic,
+Virgin Australia, United and Aeroplan returned nothing at all, which is
+worth checking by hand on seats.aero before trusting, since the benchmark
+is a Delta redemption. First class returned nothing anywhere. Alaska and
+Qantas publish seat counts on every row, American on none.
 
 ## Constraints that matter
 
@@ -97,8 +109,9 @@ delta.com before confirming. Do not remove it. It's the `FARE_BRAND_REMINDER`
 constant and the self test asserts it appears.
 
 **API budget is 1,000 calls a day, hard.** Run `--budget` after any change to
-`horizon`, `scan` or `cabins`. Adding a cabin adds no calls but adds rows,
-which adds pages. Every sweep measures calls per window and `--budget`
+`horizon`, `scan`, `cabins` or `trips`. Adding a cabin adds no calls but adds
+rows, which adds pages. Adding a trip adds a full set of calls. Four trips
+plan at 704 of 900 before pagination. Every sweep measures calls per window and `--budget`
 multiplies by that. If it climbs past about 2.5, lower `chunk_days` or raise
 `focus_interval_minutes`. `budget_safety_margin` exists so a manual `--once`
 never trips the cap.
@@ -121,15 +134,18 @@ seats.aero's crawl, not the poll interval. Do not add a live search call path.
 
 ## Likely next work
 
-- Run `--calibrate` after two weeks of `--loop` and paste the W and J numbers.
+- Run `--calibrate` after two weeks on the schedule and paste the proposed
+  numbers per trip.
+- Check which source ids return rows for Mexico, Europe and Asia and trim
+  the lists. Consider `flyingblue` for Paris, it is in the defaults.
 - Date exclusion filter for school holidays and blackout ranges.
 - Confirm which of the eight sources publish honest seat counts, then flip
   `require_seat_count` to true.
 - Consider a second signal source, since seats.aero Delta coverage may lag
   delta.com on promotional pricing.
 
-Out of scope without asking. Live Search, auto-booking, a web UI, channels
-beyond Pushover, scraping delta.com for fare brand.
+Out of scope without asking. Live Search, auto-booking, channels beyond
+Pushover and the dashboard, scraping airline sites for fare brand.
 
 ## Prose style for docs and commit messages
 
