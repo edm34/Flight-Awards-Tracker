@@ -1,0 +1,108 @@
+name: full-sweep
+
+# Full calendar sweep across the whole bookable horizon.
+# Four times a day. This is the expensive one in API calls, not minutes.
+# It resets the focus windows that focus-poll.yml then tracks.
+#
+# Runs at :17 so it never lands in the same minute as a focus poll (:07, :37).
+# A 30-minute sweep starting at :17 holds the lock through the :37 poll, which
+# waits in the queue and runs after.
+#
+# Scheduled triggers only fire from the DEFAULT branch.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+# Shared with focus-poll.yml. See the note there.
+concurrency:
+  group: award-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails the run if the state branch exists but cannot be read. The old
+      # version fell through to "starting fresh" on any error, and the save
+      # step then force-pushed a blank DB over the whole price history.
+      - name: Restore monitor state
+        id: restore
+        run: |
+          rc=0
+          git ls-remote --exit-code --heads origin monitor-state >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth=1 origin monitor-state
+            git show FETCH_HEAD:award_monitor.sqlite3 > award_monitor.sqlite3
+            echo "restored award_monitor.sqlite3 ($(stat -c%s award_monitor.sqlite3) bytes)"
+          elif [ "$rc" -eq 2 ]; then
+            echo "no monitor-state branch yet, starting fresh"
+          else
+            echo "::error::could not reach the monitor-state branch (git exit $rc); refusing to run on blank state"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Sweep
+        env:
+          SEATS_AERO_API_KEY: ${{ secrets.SEATS_AERO_API_KEY }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+        run: python monitor.py --sweep --verbose
+
+      - name: Publish leaderboard to the job summary
+        run: python monitor.py --best >> "$GITHUB_STEP_SUMMARY" || true
+
+      # Saves even when the sweep step failed partway, so alerts that already
+      # went out are recorded and not re-sent next run. Skipped only if the
+      # restore failed, because then there is nothing trustworthy to save.
+      - name: Save monitor state
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
+        run: |
+          if [ ! -f award_monitor.sqlite3 ]; then
+            echo "::warning::no award_monitor.sqlite3 to save"
+            exit 0
+          fi
+          git config user.name "award-monitor"
+          git config user.email "award-monitor@users.noreply.github.com"
+          git checkout --orphan tmp-state
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          git add -f award_monitor.sqlite3
+          git commit -m "state $(date -u +%FT%TZ)" >/dev/null
+          git push -f origin tmp-state:monitor-state
+
+  # A separate job so it still runs when the sweep job times out. A timed-out
+  # job counts as cancelled, and an in-job `if: failure()` step is skipped.
+  alert-if-down:
+    needs: sweep
+    if: ${{ always() && (needs.sweep.result == 'failure' || needs.sweep.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Tell the phone the monitor is down
+        env:
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULT: ${{ needs.sweep.result }}
+        run: |
+          curl -sS --fail -X POST https://api.pushover.net/1/messages.json \
+            --form-string "token=${PUSHOVER_APP_TOKEN}" \
+            --form-string "user=${PUSHOVER_USER_KEY}" \
+            --form-string "priority=1" \
+            --form-string "title=Award monitor DOWN (${GITHUB_WORKFLOW})" \
+            --form-string "message=${GITHUB_WORKFLOW} ${RESULT} at $(date -u +%H:%MZ). No award alerts until this is fixed." \
+            --form-string "url=${RUN_URL}" \
+            --form-string "url_title=Open the failed run" >/dev/null

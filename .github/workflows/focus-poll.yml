@@ -1,0 +1,114 @@
+name: focus-poll
+
+# Re-polls the months around the current best combinations.
+# Every 30 minutes keeps the private-repo free tier at roughly 1,560 of the
+# 2,000 monthly minutes. Do not tighten this to every 15 minutes without
+# checking billing, and see the note in BUILD-HOSTING.md about why 30 is not
+# really slower.
+#
+# Runs at :07 and :37, not :00 and :30. The top of the hour is when GitHub's
+# scheduler is most delayed, and :00 is also when full-sweep used to fire,
+# which put both runs into the concurrency queue at the same moment.
+#
+# Scheduled triggers only fire from the DEFAULT branch. This file does nothing
+# on a feature branch until it is merged.
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+# Shared with full-sweep.yml so the two can never write state at the same time.
+# GitHub keeps one running and one pending run per group. A newer pending run
+# replaces an older pending one, so a skipped poll is possible but a state
+# clobber is not.
+concurrency:
+  group: award-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails the run if the state branch exists but cannot be read. The old
+      # version fell through to "starting fresh" on any error, and the save
+      # step then force-pushed a blank DB over the whole price history.
+      - name: Restore monitor state
+        id: restore
+        run: |
+          rc=0
+          git ls-remote --exit-code --heads origin monitor-state >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth=1 origin monitor-state
+            git show FETCH_HEAD:award_monitor.sqlite3 > award_monitor.sqlite3
+            echo "restored award_monitor.sqlite3 ($(stat -c%s award_monitor.sqlite3) bytes)"
+          elif [ "$rc" -eq 2 ]; then
+            echo "no monitor-state branch yet, starting fresh"
+          else
+            echo "::error::could not reach the monitor-state branch (git exit $rc); refusing to run on blank state"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Poll
+        env:
+          SEATS_AERO_API_KEY: ${{ secrets.SEATS_AERO_API_KEY }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+        run: python monitor.py --once --verbose
+
+      - name: Publish leaderboard to the job summary
+        run: python monitor.py --best >> "$GITHUB_STEP_SUMMARY" || true
+
+      # Saves even when the poll step failed partway, so alerts that already
+      # went out are recorded and not re-sent next run. Skipped only if the
+      # restore failed, because then there is nothing trustworthy to save.
+      - name: Save monitor state
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
+        run: |
+          if [ ! -f award_monitor.sqlite3 ]; then
+            echo "::warning::no award_monitor.sqlite3 to save"
+            exit 0
+          fi
+          git config user.name "award-monitor"
+          git config user.email "award-monitor@users.noreply.github.com"
+          git checkout --orphan tmp-state
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          git add -f award_monitor.sqlite3
+          git commit -m "state $(date -u +%FT%TZ)" >/dev/null
+          git push -f origin tmp-state:monitor-state
+
+  # A separate job so it still runs when the poll job times out. A timed-out
+  # job counts as cancelled, and an in-job `if: failure()` step is skipped.
+  alert-if-down:
+    needs: poll
+    if: ${{ always() && (needs.poll.result == 'failure' || needs.poll.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Tell the phone the monitor is down
+        env:
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULT: ${{ needs.poll.result }}
+        run: |
+          curl -sS --fail -X POST https://api.pushover.net/1/messages.json \
+            --form-string "token=${PUSHOVER_APP_TOKEN}" \
+            --form-string "user=${PUSHOVER_USER_KEY}" \
+            --form-string "priority=1" \
+            --form-string "title=Award monitor DOWN (${GITHUB_WORKFLOW})" \
+            --form-string "message=${GITHUB_WORKFLOW} ${RESULT} at $(date -u +%H:%MZ). No award alerts until this is fixed." \
+            --form-string "url=${RUN_URL}" \
+            --form-string "url_title=Open the failed run" >/dev/null

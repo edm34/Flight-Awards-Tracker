@@ -57,14 +57,13 @@ CABIN_ORDER = ("Y", "W", "J", "F")
 CABIN_NAMES = {"Y": "Economy", "W": "Premium Economy", "J": "Business", "F": "First"}
 
 # seats.aero names its response fields with one letter cabin codes but filters
-# rows with word values. Confirmed against two public client libraries, not
-# against a live call. --probe prints the HTTP status if this turns out wrong.
+# rows with word values under a "cabins" parameter. Both confirmed live on
+# 11 Sep 2026, the server's own moreURL spells it this way.
 CABIN_QUERY_VALUES = {"Y": "economy", "W": "premium", "J": "business", "F": "first"}
 
-# Candidate daily quota headers. requests matches header names case
-# insensitively, so these three cover the variants seen in the wild. The one
-# that actually matches is remembered in state and shown by --budget.
-QUOTA_HEADERS = ("x-ratelimit-remaining", "x-quota-remaining", "ratelimit-remaining")
+# Daily quota header, confirmed live. The API also sends x-ratelimit-limit
+# (1000) and x-ratelimit-reset (seconds until the UTC midnight reset).
+QUOTA_HEADER = "x-ratelimit-remaining"
 
 # --calibrate refuses to propose thresholds on thinner history than this.
 CALIBRATE_MIN_COMBOS = 200
@@ -261,6 +260,13 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
     alerting.setdefault("require_seat_count", False)
     alerting.setdefault("improvement_threshold_miles", 0)
     alerting.setdefault("cooldown_hours", 6)
+
+    scan = cfg["scan"]
+    scan.setdefault("mode", "loop")
+    if scan["mode"] not in ("loop", "scheduled"):
+        fail(f"scan.mode must be loop or scheduled, not {scan['mode']!r}")
+    scan.setdefault("sweeps_per_day", 4)
+    scan.setdefault("polls_per_day", 48)
 
     api = cfg["api"]
     api.setdefault("budget_safety_margin", 0)
@@ -538,7 +544,7 @@ class SeatsAero:
         return {
             "origin_airport": ",".join(origins),
             "destination_airport": ",".join(destinations),
-            "cabin": ",".join(CABIN_QUERY_VALUES[c] for c in cabins),
+            "cabins": ",".join(CABIN_QUERY_VALUES[c] for c in cabins),
             "sources": ",".join(sources),
             "start_date": start_date,
             "end_date": end_date,
@@ -556,16 +562,14 @@ class SeatsAero:
         return resp
 
     def _quota_from(self, resp: requests.Response) -> int | None:
-        for header in QUOTA_HEADERS:
-            if header in resp.headers:
-                if self.store.get_state("quota_header") != header:
-                    LOG.info("Quota header is %s", header)
-                    self.store.set_state("quota_header", header)
-                try:
-                    return int(resp.headers[header])
-                except ValueError:
-                    return None
-        return None
+        if QUOTA_HEADER not in resp.headers:
+            return None
+        if self.store.get_state("quota_header") != QUOTA_HEADER:
+            self.store.set_state("quota_header", QUOTA_HEADER)
+        try:
+            return int(resp.headers[QUOTA_HEADER])
+        except ValueError:
+            return None
 
     def cached_search(self, origins: list[str], destinations: list[str],
                       cabins: list[str], sources: list[str],
@@ -646,17 +650,18 @@ def _to_int(value: Any) -> int:
 def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
     """One seats.aero Availability object into one Leg per populated cabin.
 
-    Field names follow the published Availability schema. Mileage comes from
-    the integer <cabin>MileageCostRaw when present and the string
-    <cabin>MileageCost otherwise. <cabin>TotalTaxes is an integer in the minor
-    unit of TaxesCurrency, so it is divided by 100. Confirm that one row
-    against delta.com on the first live run, see --probe."""
+    Field names were reconciled against a live response on 11 Sep 2026.
+    <cabin>MileageCost is a string of digits, <cabin>TotalTaxes an integer in
+    the minor unit of TaxesCurrency (40860 USD is $408.60), UpdatedAt is the
+    freshness stamp. Every field also has a *Raw twin holding the value
+    before seats.aero's own quality filter. The parser reads the filtered
+    set, which is what the seats.aero site shows."""
     route = obj.get("Route") or {}
-    origin = route.get("OriginAirport") or obj.get("OriginAirport") or ""
-    destination = route.get("DestinationAirport") or obj.get("DestinationAirport") or ""
+    origin = route.get("OriginAirport") or ""
+    destination = route.get("DestinationAirport") or ""
     source = obj.get("Source") or route.get("Source") or "unknown"
     depart_date = (obj.get("Date") or "")[:10]
-    last_seen = obj.get("ComputedLastSeen") or obj.get("UpdatedAt") or ""
+    last_seen = obj.get("UpdatedAt") or ""
     currency = obj.get("TaxesCurrency") or "USD"
     now = datetime.now(timezone.utc).isoformat()
 
@@ -664,9 +669,7 @@ def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
     for cabin in cabins:
         if not obj.get(f"{cabin}Available"):
             continue
-        miles = _to_int(obj.get(f"{cabin}MileageCostRaw"))
-        if miles <= 0:
-            miles = _to_int(obj.get(f"{cabin}MileageCost"))
+        miles = _to_int(obj.get(f"{cabin}MileageCost"))
         if miles <= 0:
             continue
         legs.append(Leg(
@@ -939,6 +942,17 @@ def evaluate(cfg: dict, store: Store, dry_run: bool) -> dict[str, list[RoundTrip
     return {code: [rt for rt, _ in rows] for code, rows in ranked.items()}
 
 
+def prune_history(cfg: dict, store: Store) -> int:
+    """Drop observations past the retention window. Runs at the end of every
+    sweep and focus poll so scheduled mode, which never enters the loop,
+    still keeps the database bounded."""
+    dropped = store.prune(cfg["storage"]["retain_observation_days"])
+    if dropped:
+        LOG.info("Pruned %d observations older than %d days", dropped,
+                 cfg["storage"]["retain_observation_days"])
+    return dropped
+
+
 def run_sweep(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None:
     chunks = horizon_chunks(cfg)
     codes, sources = query_plan(cfg)
@@ -965,6 +979,7 @@ def run_sweep(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
         })
     store.set_state("last_sweep", datetime.now(timezone.utc).isoformat())
     evaluate(cfg, store, dry_run)
+    prune_history(cfg, store)
 
 
 def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None:
@@ -981,6 +996,7 @@ def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
     LOG.info("Focus poll of %d windows done in %d calls, %d calls left",
              len(focus_dates), calls_total, client.budget_left())
     evaluate(cfg, store, dry_run)
+    prune_history(cfg, store)
 
 
 def run_probe(cfg: dict, client: SeatsAero) -> None:
@@ -1002,16 +1018,15 @@ def run_probe(cfg: dict, client: SeatsAero) -> None:
         return
     print(f"\nHTTP {resp.status_code} in {time.monotonic() - t0:.2f}s")
     print("Response headers")
-    matched = next((h for h in QUOTA_HEADERS if h in resp.headers), None)
     for k, v in resp.headers.items():
-        tag = "   <- daily quota" if matched and k.lower() == matched else ""
+        tag = "   <- daily quota" if k.lower() == QUOTA_HEADER else ""
         print(f"  {k}: {v}{tag}")
-    if not matched:
-        print("  (no header in QUOTA_HEADERS matched, pick the right one from the list above)")
+    if QUOTA_HEADER not in resp.headers:
+        print(f"  ({QUOTA_HEADER} not present, budget tracking will run blind)")
     if resp.status_code != 200:
         print(f"\nBody: {resp.text[:800]}")
         print("\nA 400 here usually means a query value is wrong. "
-              "The cabin filter sends word values, see CABIN_QUERY_VALUES.")
+              "The cabins filter sends word values, see CABIN_QUERY_VALUES.")
         return
 
     body = resp.json()
@@ -1035,15 +1050,14 @@ def run_probe(cfg: dict, client: SeatsAero) -> None:
         ("Route.DestinationAirport", route.get("DestinationAirport")),
         ("Source", obj.get("Source")),
         ("Date", obj.get("Date")),
-        ("ComputedLastSeen", obj.get("ComputedLastSeen")),
         ("UpdatedAt", obj.get("UpdatedAt")),
         ("TaxesCurrency", obj.get("TaxesCurrency")),
     ]
     for name, val in checks:
         print(f"  {name:26} {'ok' if val not in (None, '') else 'MISSING':8} {val!r}")
     for code in CABIN_ORDER:
-        fields = ["Available", "MileageCost", "MileageCostRaw", "RemainingSeats",
-                  "TotalTaxes", "Airlines", "Direct"]
+        fields = ["Available", "MileageCost", "RemainingSeats", "TotalTaxes",
+                  "Airlines", "Direct"]
         bits = []
         for f in fields:
             key = f"{code}{f}"
@@ -1142,6 +1156,11 @@ def show_best(cfg: dict, store: Store, limit: int = 15, cabin: str | None = None
                              + ", ".join(c["code"] for c in enabled_cabins(cfg)))
 
     routes = f"{'/'.join(trip['outbound_origins'])} to {'/'.join(trip['outbound_destinations'])}"
+    # A GitHub job summary renders markdown, which would collapse the columns.
+    # Fence the whole table there. Plain terminals get plain text.
+    fence = os.environ.get("GITHUB_ACTIONS") == "true"
+    if fence:
+        print("```")
     print(f"\nCheapest round trips for {party}, {routes}, per person, "
           f"data from the last {age_hours // 24} days")
     if not legs:
@@ -1150,6 +1169,8 @@ def show_best(cfg: dict, store: Store, limit: int = 15, cabin: str | None = None
     for c in cabins:
         print_best_section(c, ranked[c["code"]], seen[c["code"]], party, trip, limit,
                            show_cabins=trip.get("allow_mixed_cabin", False))
+    if fence:
+        print("```")
 
 
 def show_stats(cfg: dict, store: Store) -> None:
@@ -1179,20 +1200,34 @@ def show_stats(cfg: dict, store: Store) -> None:
 
 
 def budget_plan(cfg: dict, store: Store) -> dict:
-    """Theoretical plan plus the measured pagination from the last sweep."""
+    """Calls per day in either mode, multiplied by the pagination measured on
+    the last sweep. Nothing here makes a live call.
+
+    loop       one process, sweeps every sweep_interval_hours and focus polls
+               every focus_interval_minutes in between
+    scheduled  GitHub Actions runs --sweep sweeps_per_day times and --once
+               polls_per_day times, mirroring the crons in .github/workflows
+    """
     chunks = horizon_chunks(cfg)
     scan = cfg["scan"]
-    sweeps = 24 / scan["sweep_interval_hours"]
-    focus_polls = (24 * 60) / scan["focus_interval_minutes"] - sweeps
     cap = cfg["api"]["daily_call_budget"] - cfg["api"]["budget_safety_margin"]
     stats = store.get_state("sweep_stats") or {}
     measured = stats.get("calls_per_window")
     per_window = measured if measured else 2.0
-    sweep_calls = len(chunks) * per_window * sweeps
-    focus_calls = scan["max_focus_windows"] * per_window * focus_polls
+    if scan["mode"] == "scheduled":
+        sweeps = float(scan["sweeps_per_day"])
+        focus_polls = float(scan["polls_per_day"])
+    else:
+        sweeps = 24 / scan["sweep_interval_hours"]
+        focus_polls = (24 * 60) / scan["focus_interval_minutes"] - sweeps
+    per_sweep = len(chunks) * per_window
+    per_poll = scan["max_focus_windows"] * per_window
+    sweep_calls = per_sweep * sweeps
+    focus_calls = per_poll * focus_polls
     return {
-        "windows": len(chunks), "sweeps": sweeps, "focus_polls": focus_polls,
-        "cap": cap, "measured": measured, "per_window": per_window,
+        "mode": scan["mode"], "windows": len(chunks), "sweeps": sweeps,
+        "focus_polls": focus_polls, "cap": cap, "measured": measured,
+        "per_window": per_window, "per_sweep": per_sweep, "per_poll": per_poll,
         "sweep_calls": sweep_calls, "focus_calls": focus_calls,
         "planned": sweep_calls + focus_calls, "stats": stats,
     }
@@ -1202,7 +1237,13 @@ def show_budget(cfg: dict, store: Store) -> None:
     p = budget_plan(cfg, store)
     h, scan, api = cfg["horizon"], cfg["scan"], cfg["api"]
     codes, sources = query_plan(cfg)
-    print(f"\nHorizon     {h['min_days_out']} to {h['max_days_out']} days out, "
+    if p["mode"] == "scheduled":
+        print(f"\nMode        scheduled, GitHub Actions runs --once {p['focus_polls']:.0f} "
+              f"times and --sweep {p['sweeps']:.0f} times a day")
+    else:
+        print(f"\nMode        loop, one process sweeping every {scan['sweep_interval_hours']}h "
+              f"and polling every {scan['focus_interval_minutes']}min")
+    print(f"Horizon     {h['min_days_out']} to {h['max_days_out']} days out, "
           f"{p['windows']} windows of {h['chunk_days']} days")
     print(f"Per call    cabins {''.join(codes)}, {len(sources)} sources, "
           f"{api['page_size']} rows per page, up to {api['max_pages_per_query']} pages")
@@ -1215,10 +1256,12 @@ def show_budget(cfg: dict, store: Store) -> None:
     else:
         print("Pagination  not measured yet, assuming one page per direction "
               "(2 calls per window). Run --sweep to measure.")
-    print(f"Sweeps      {p['sweeps']:.0f}/day x {p['windows']} windows x "
-          f"{p['per_window']:.2f} calls = {p['sweep_calls']:.0f} calls")
-    print(f"Focus       {p['focus_polls']:.0f}/day x {scan['max_focus_windows']} windows x "
-          f"{p['per_window']:.2f} calls = {p['focus_calls']:.0f} calls")
+    print(f"Per sweep   {p['windows']} windows x {p['per_window']:.2f} calls = "
+          f"{p['per_sweep']:.0f} calls")
+    print(f"Per poll    {scan['max_focus_windows']} focus windows x {p['per_window']:.2f} calls = "
+          f"{p['per_poll']:.0f} calls")
+    print(f"Sweeps      {p['sweeps']:.0f}/day x {p['per_sweep']:.0f} = {p['sweep_calls']:.0f} calls")
+    print(f"Polls       {p['focus_polls']:.0f}/day x {p['per_poll']:.0f} = {p['focus_calls']:.0f} calls")
     print(f"Planned     {p['planned']:.0f} of {p['cap']} usable "
           f"({api['daily_call_budget']} cap minus {api['budget_safety_margin']} margin)")
     used = store.calls_today()
@@ -1229,11 +1272,13 @@ def show_budget(cfg: dict, store: Store) -> None:
         line += f", {header} reports {quota} left"
     print(line)
     if p["planned"] > p["cap"]:
-        print("\nOVER BUDGET. Raise horizon.chunk_days, scan.sweep_interval_hours "
-              "or scan.focus_interval_minutes, then run --budget again.")
+        fix = ("Raise horizon.chunk_days or lower scan.max_focus_windows"
+               if p["mode"] == "scheduled" else
+               "Raise horizon.chunk_days, scan.sweep_interval_hours or scan.focus_interval_minutes")
+        print(f"\nOVER BUDGET. {fix}, then run --budget again.")
     elif p["measured"] and p["per_window"] > 2.5:
         print("\nPagination is eating the margin. Lower horizon.chunk_days so each "
-              "query covers fewer dates, or raise scan.focus_interval_minutes.")
+              "query covers fewer dates, or poll less often.")
     print()
 
 
@@ -1432,12 +1477,15 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    """Stands in for requests.Session. Records every call it receives."""
-    def __init__(self, pages: list[_FakeResponse]):
-        self.pages, self.calls = list(pages), []
+    """Stands in for requests.Session. Records every call it receives. With
+    repeat_last the final page answers every call after the list runs out."""
+    def __init__(self, pages: list[_FakeResponse], repeat_last: bool = False):
+        self.pages, self.calls, self.repeat_last = list(pages), [], repeat_last
 
     def get(self, url: str, params: dict | None = None, timeout: float = 0) -> _FakeResponse:
         self.calls.append((url, dict(params or {})))
+        if len(self.pages) == 1 and self.repeat_last:
+            return self.pages[0]
         return self.pages.pop(0)
 
 
@@ -1483,25 +1531,30 @@ def self_test() -> None:
 
     # -- parsing ------------------------------------------------------------
     def av(oid, source, o, d, day, **cabins):
+        """An Availability object in the exact shape the live API returned on
+        11 Sep 2026. Every cabin field has a *Raw twin and a Direct variant,
+        MileageCost is a string, UpdatedAt is the freshness stamp."""
         obj = {
-            "ID": oid, "Source": source, "Date": day, "TaxesCurrency": "USD",
-            "Route": {"OriginAirport": o, "DestinationAirport": d, "Source": source},
-            "ComputedLastSeen": now,
+            "ID": oid, "RouteID": f"r-{oid}", "Source": source, "Date": day,
+            "ParsedDate": f"{day}T00:00:00Z", "TaxesCurrency": "USD",
+            "Route": {"ID": f"r-{oid}", "OriginAirport": o, "OriginRegion": "",
+                      "DestinationAirport": d, "DestinationRegion": "",
+                      "Distance": 9950, "Source": source},
+            "CreatedAt": "2025-10-31T21:02:21.568283Z", "UpdatedAt": now,
+            "AvailabilityTrips": [],
         }
         for code in CABIN_ORDER:
-            obj[f"{code}Available"] = False
-            obj[f"{code}MileageCost"] = "0"
-            obj[f"{code}MileageCostRaw"] = 0
-            obj[f"{code}RemainingSeats"] = 0
-            obj[f"{code}TotalTaxes"] = 0
-            obj[f"{code}Airlines"] = ""
-        for code, (miles, seats, taxes) in cabins.items():
-            obj[f"{code}Available"] = True
-            obj[f"{code}MileageCost"] = str(miles)
-            obj[f"{code}MileageCostRaw"] = miles
-            obj[f"{code}RemainingSeats"] = seats
-            obj[f"{code}TotalTaxes"] = taxes
-            obj[f"{code}Airlines"] = "DL" if source == "delta" else "QF"
+            miles, seats, taxes = cabins.get(code, (0, 0, 0))
+            airline = ("DL" if source == "delta" else "QF") if miles else ""
+            for prefix in ("", "Direct"):
+                for suffix in ("", "Raw"):
+                    k = f"{code}{prefix}"
+                    obj[f"{k}Available{suffix}"] = bool(miles) and not prefix
+                    obj[f"{k}MileageCost{suffix}"] = (str(miles) if not suffix else miles) if not prefix else 0
+                    obj[f"{k}RemainingSeats{suffix}"] = seats if not prefix else 0
+                    obj[f"{k}TotalTaxes{suffix}"] = taxes if not prefix else 0
+                    obj[f"{k}Airlines{suffix}"] = airline if not prefix else ""
+                    obj[f"{k}{suffix}"] = False
         return obj
 
     sample = av("p1", "delta", "JFK", "SYD", "2027-02-10",
@@ -1510,12 +1563,19 @@ def self_test() -> None:
     legs = parse_availability(sample, CABIN_ORDER)
     assert [l.cabin for l in legs] == ["Y", "W", "J"], legs
     assert legs[0].miles == 33100 and legs[0].taxes_usd == 66.25 and legs[0].taxes_currency == "USD"
+    assert legs[0].last_seen == now and legs[0].airlines == "DL"
     assert legs[2].direct is True and legs[1].direct is False
-    string_only = dict(sample)
-    del string_only["YMileageCostRaw"]
-    assert parse_availability(string_only, ["Y"])[0].miles == 33100, "string fallback"
     assert parse_availability(dict(sample, YAvailable=False), ["Y"]) == []
-    print("parse ok: four cabin fields, Raw preferred over string, taxes in minor units")
+    assert parse_availability(dict(sample, YMileageCost="0"), ["Y"]) == []
+    # The one real row from the probe, trimmed to the fields the parser reads.
+    live = {"ID": "x", "Route": {"OriginAirport": "BOS", "DestinationAirport": "SYD", "Source": "qantas"},
+            "Date": "2026-10-26", "YAvailable": True, "YMileageCost": "69900",
+            "YRemainingSeats": 1, "YTotalTaxes": 40860, "YAirlines": "EK", "YDirect": False,
+            "TaxesCurrency": "USD", "Source": "qantas", "UpdatedAt": "2026-09-10T18:45:54.293483Z"}
+    leg = parse_availability(live, CABIN_ORDER)
+    assert len(leg) == 1 and leg[0].miles == 69900 and leg[0].taxes_usd == 408.60, leg
+    assert leg[0].seats == 1 and leg[0].last_seen.startswith("2026-09-10")
+    print("parse ok: live response shape, string mileage, taxes in minor units, UpdatedAt")
 
     # -- fixtures -----------------------------------------------------------
     raw = [
@@ -1637,19 +1697,21 @@ def self_test() -> None:
     res = client.cached_search(["JFK"], ["SYD"], ["Y", "J"], ["delta"], "2027-02-01", "2027-03-03")
     assert len(res.rows) == 3 and res.calls == 3 and not res.capped, (len(res.rows), res.calls)
     calls = client.session.calls
-    assert "cursor" not in calls[0][1] and calls[0][1]["cabin"] == "economy,business", calls[0]
+    assert "cursor" not in calls[0][1] and calls[0][1]["cabins"] == "economy,business", calls[0]
     assert calls[1][1]["cursor"] == 1700000000 and calls[1][1]["skip"] == 2, calls[1]
     assert calls[2][1]["cursor"] == 1700000000 and calls[2][1]["skip"] == 3, "cursor must stay the first one"
     assert store.get_state("quota_header") == "x-ratelimit-remaining"
     assert store.quota_remaining_today() == 990 and store.calls_today() == 3
 
+    more = ("/partnerapi/search?take=25&skip=25&origin_airport=JFK&destination_airport=SYD"
+            "&cursor=1789152528&start_date=2027-02-01&end_date=2027-03-03&cabins=economy&sources=delta")
     client.session = _FakeSession([
-        _FakeResponse({"data": [raw[0]], "hasMore": True, "cursor": 5,
-                       "moreURL": "/partnerapi/search?cursor=5&skip=1&x=1"}),
-        _FakeResponse({"data": [raw[1]], "hasMore": False}),
+        _FakeResponse({"data": [raw[0]], "count": 1, "hasMore": True, "cursor": 1789152528, "moreURL": more}),
+        _FakeResponse({"data": [raw[1]], "count": 1, "hasMore": False, "cursor": 1789152528, "moreURL": ""}),
     ])
     res = client.cached_search(["JFK"], ["SYD"], ["Y"], ["delta"], "2027-02-01", "2027-03-03")
-    assert res.calls == 2 and client.session.calls[1][0] == "https://seats.aero/partnerapi/search?cursor=5&skip=1&x=1"
+    assert res.calls == 2 and client.session.calls[1][0] == "https://seats.aero" + more, client.session.calls[1]
+    assert client.session.calls[1][1] == {}, "moreURL already carries the query"
 
     client.session = _FakeSession([
         _FakeResponse({"data": [raw[0]], "hasMore": True, "cursor": 1}) for _ in range(5)])
@@ -1670,7 +1732,56 @@ def self_test() -> None:
     with redirect_stdout(buf):
         show_budget(cfg, store)
     assert "measured 2.60 calls per window" in buf.getvalue(), buf.getvalue()
-    print("budget ok: plan multiplies by measured calls per window")
+    assert plan["mode"] == "loop" and plan["sweeps"] == 4 and plan["focus_polls"] == 92
+    print("budget ok: loop plan multiplies by measured calls per window")
+
+    # -- budget in scheduled mode ---------------------------------------------
+    sched = copy.deepcopy(cfg)
+    sched["scan"].update({"mode": "scheduled", "polls_per_day": 48, "sweeps_per_day": 4})
+    plan = budget_plan(sched, store)
+    close = math.isclose
+    assert close(plan["per_sweep"], 26) and close(plan["per_poll"], 7.8), plan
+    assert close(plan["sweep_calls"], 104) and close(plan["focus_calls"], 374.4), plan
+    assert close(plan["planned"], 478.4) and plan["planned"] < 900, plan
+    fresh_plan = budget_plan(sched, Store(":memory:"))
+    assert fresh_plan["planned"] == 4 * 20 + 48 * 6, fresh_plan
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        show_budget(sched, store)
+    out = buf.getvalue()
+    assert "Mode        scheduled" in out and "--once 48 times" in out and "Polls       48/day" in out, out
+    _expect_fail(broken(lambda r: r["scan"].update({"mode": "cron"})), "scan.mode")
+    print(f"budget ok: scheduled plan is {plan['planned']:.0f} calls a day at measured pagination")
+
+    # -- prune runs at the end of --sweep and --once --------------------------
+    for label, runner in (("sweep", run_sweep), ("once", run_focus)):
+        pst = Store(":memory:")
+        stale = (now_dt - timedelta(days=500)).isoformat()
+        pst.record_legs([
+            Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, stale, stale),
+            Leg("s", "delta", "JFK", "SYD", "2027-03-02", "Y", 30000, 66.0, 4, "DL", False, now, now),
+        ])
+        pst.set_state("focus_dates", ["2027-03-14"])
+        pcl = SeatsAero(cfg, pst, api_key="test-key")
+        pcl.session = _FakeSession([_FakeResponse({"data": [], "hasMore": False})], repeat_last=True)
+        with redirect_stdout(io.StringIO()):
+            runner(cfg, pst, pcl, True)
+        left = pst.conn.execute("SELECT observed_at FROM observations").fetchall()
+        assert [r[0] for r in left] == [now], f"{label} kept {left}"
+        assert pst.calls_today() == (20 if label == "sweep" else 2), pst.calls_today()
+    print("prune ok: --sweep and --once both drop rows past retention and keep the rest")
+
+    # -- leaderboard fenced for a job summary ---------------------------------
+    os.environ["GITHUB_ACTIONS"] = "true"
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            show_best(cfg, store, cabin="Y")
+    finally:
+        del os.environ["GITHUB_ACTIONS"]
+    lines = buf.getvalue().strip().splitlines()
+    assert lines[0] == "```" and lines[-1] == "```", lines[:2]
+    print("summary ok: --best fences its table under GitHub Actions")
 
     # -- calibration --------------------------------------------------------
     cals = calibrate(cfg, store)
@@ -1802,7 +1913,6 @@ def main() -> None:
                     run_sweep(cfg, store, client, args.dry_run)
                 else:
                     run_focus(cfg, store, client, args.dry_run)
-                store.prune(cfg["storage"]["retain_observation_days"])
             except Exception:
                 LOG.exception("Cycle failed, continuing")
             time.sleep(interval)

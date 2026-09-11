@@ -46,6 +46,15 @@ calibration, self test, main.
   back, so `--budget` reflects measured pagination.
 - `RoundTrip.cabin` is the cabin a trip ranks under. Mixed pairings, only
   possible when `trip.allow_mixed_cabin` is true, rank under the lower cabin.
+- `scan.mode` is `loop` or `scheduled`. Scheduled mode is GitHub Actions
+  running `--sweep` and `--once` on the crons in `.github/workflows`, with
+  the database kept on the `monitor-state` branch. `budget_plan` prices the
+  day from `polls_per_day` and `sweeps_per_day` in that mode. `run_sweep` and
+  `run_focus` both call `prune_history` on the way out, because scheduled
+  mode never enters the loop.
+- Never commit `.env` or the database. Credentials are repository secrets.
+  The workflow files are Eric's, reviewed outside the repo. Don't rework the
+  restore, save, concurrency or alert-if-down logic without asking.
 
 ## What is verified and what is not
 
@@ -58,28 +67,20 @@ empty sections and `--cabin`, the pagination protocol against a fake session,
 budget arithmetic with measured pagination, and calibration refusal and
 proposal on synthetic history.
 
-Verified against the published Availability schema and two open source client
-libraries, not against a live call. Field names `ID`, `Route.OriginAirport`,
-`Source`, `Date`, `TaxesCurrency`, `<cabin>Available`, `<cabin>MileageCost`
-as a string with an integer `<cabin>MileageCostRaw`, `<cabin>RemainingSeats`,
-`<cabin>TotalTaxes` as an integer, `<cabin>Airlines`, and the pagination
-shape `data`, `count`, `hasMore`, `cursor` where the cursor from the first
-response is reused with a growing `skip`.
+Verified against a live response on 11 Sep 2026 by `--probe`. Field names
+`ID`, `Route.OriginAirport`, `Source`, `Date`, `UpdatedAt`, `TaxesCurrency`,
+per cabin `Available`, `MileageCost` as a string, `RemainingSeats`,
+`TotalTaxes` as an integer in the minor unit (40860 USD was $408.60 on a
+Qantas economy seat, plausible), `Airlines` and `Direct`. Every field has a
+`Raw` twin holding the pre-filter value, the parser reads the filtered set.
+The pagination shape is `data`, `count`, `hasMore`, `cursor` and `moreURL`.
+The quota header is `x-ratelimit-remaining` against `x-ratelimit-limit`
+1000. The cabin filter is the `cabins` parameter with word values. There is
+no `ComputedLastSeen`.
 
-**Not verified against the live API.** Nobody has run this with a real
-`SEATS_AERO_API_KEY`. `--probe` makes one call and prints what is needed to
-close each of these. Fix the code rather than working around it.
-
-1. That `<cabin>TotalTaxes` is in the minor unit, so the code divides by 100.
-   Check one row against delta.com.
-2. That the cabin filter takes word values (`economy,premium,business,first`).
-   A 400 from the probe means it doesn't.
-3. Whether `ComputedLastSeen`, `<cabin>Direct` and `moreURL` exist. The
-   parser falls back to `UpdatedAt`, false and cursor plus skip respectively.
-4. The daily quota header name. `QUOTA_HEADERS` tries three. The probe prints
-   every header and marks the match, and the matched name is stored in state.
-5. Which programs return anything in J and F for these routes. Empty is a
-   finding, not a bug.
+Still open after one probe page. Which programs return anything in J and F
+for these routes. The first page of Oct to Nov 2026 had Y 25, W 3, J 0, F 0.
+Empty is a finding, not a bug. The first full sweep will say.
 
 ## Constraints that matter
 
@@ -120,7 +121,6 @@ seats.aero's crawl, not the poll interval. Do not add a live search call path.
 
 ## Likely next work
 
-- Run `--probe` with a real key and close the five unverified items above.
 - Run `--calibrate` after two weeks of `--loop` and paste the W and J numbers.
 - Date exclusion filter for school holidays and blackout ranges.
 - Confirm which of the eight sources publish honest seat counts, then flip
