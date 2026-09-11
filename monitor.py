@@ -262,6 +262,13 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
     alerting.setdefault("improvement_threshold_miles", 0)
     alerting.setdefault("cooldown_hours", 6)
 
+    scan = cfg["scan"]
+    scan.setdefault("mode", "loop")
+    if scan["mode"] not in ("loop", "scheduled"):
+        fail(f"scan.mode must be loop or scheduled, not {scan['mode']!r}")
+    scan.setdefault("sweeps_per_day", 4)
+    scan.setdefault("polls_per_day", 48)
+
     api = cfg["api"]
     api.setdefault("budget_safety_margin", 0)
     api.setdefault("max_pages_per_query", 20)
@@ -939,6 +946,17 @@ def evaluate(cfg: dict, store: Store, dry_run: bool) -> dict[str, list[RoundTrip
     return {code: [rt for rt, _ in rows] for code, rows in ranked.items()}
 
 
+def prune_history(cfg: dict, store: Store) -> int:
+    """Drop observations past the retention window. Runs at the end of every
+    sweep and focus poll so scheduled mode, which never enters the loop,
+    still keeps the database bounded."""
+    dropped = store.prune(cfg["storage"]["retain_observation_days"])
+    if dropped:
+        LOG.info("Pruned %d observations older than %d days", dropped,
+                 cfg["storage"]["retain_observation_days"])
+    return dropped
+
+
 def run_sweep(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None:
     chunks = horizon_chunks(cfg)
     codes, sources = query_plan(cfg)
@@ -965,6 +983,7 @@ def run_sweep(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
         })
     store.set_state("last_sweep", datetime.now(timezone.utc).isoformat())
     evaluate(cfg, store, dry_run)
+    prune_history(cfg, store)
 
 
 def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None:
@@ -981,6 +1000,7 @@ def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
     LOG.info("Focus poll of %d windows done in %d calls, %d calls left",
              len(focus_dates), calls_total, client.budget_left())
     evaluate(cfg, store, dry_run)
+    prune_history(cfg, store)
 
 
 def run_probe(cfg: dict, client: SeatsAero) -> None:
@@ -1142,6 +1162,11 @@ def show_best(cfg: dict, store: Store, limit: int = 15, cabin: str | None = None
                              + ", ".join(c["code"] for c in enabled_cabins(cfg)))
 
     routes = f"{'/'.join(trip['outbound_origins'])} to {'/'.join(trip['outbound_destinations'])}"
+    # A GitHub job summary renders markdown, which would collapse the columns.
+    # Fence the whole table there. Plain terminals get plain text.
+    fence = os.environ.get("GITHUB_ACTIONS") == "true"
+    if fence:
+        print("```")
     print(f"\nCheapest round trips for {party}, {routes}, per person, "
           f"data from the last {age_hours // 24} days")
     if not legs:
@@ -1150,6 +1175,8 @@ def show_best(cfg: dict, store: Store, limit: int = 15, cabin: str | None = None
     for c in cabins:
         print_best_section(c, ranked[c["code"]], seen[c["code"]], party, trip, limit,
                            show_cabins=trip.get("allow_mixed_cabin", False))
+    if fence:
+        print("```")
 
 
 def show_stats(cfg: dict, store: Store) -> None:
@@ -1179,20 +1206,34 @@ def show_stats(cfg: dict, store: Store) -> None:
 
 
 def budget_plan(cfg: dict, store: Store) -> dict:
-    """Theoretical plan plus the measured pagination from the last sweep."""
+    """Calls per day in either mode, multiplied by the pagination measured on
+    the last sweep. Nothing here makes a live call.
+
+    loop       one process, sweeps every sweep_interval_hours and focus polls
+               every focus_interval_minutes in between
+    scheduled  GitHub Actions runs --sweep sweeps_per_day times and --once
+               polls_per_day times, mirroring the crons in .github/workflows
+    """
     chunks = horizon_chunks(cfg)
     scan = cfg["scan"]
-    sweeps = 24 / scan["sweep_interval_hours"]
-    focus_polls = (24 * 60) / scan["focus_interval_minutes"] - sweeps
     cap = cfg["api"]["daily_call_budget"] - cfg["api"]["budget_safety_margin"]
     stats = store.get_state("sweep_stats") or {}
     measured = stats.get("calls_per_window")
     per_window = measured if measured else 2.0
-    sweep_calls = len(chunks) * per_window * sweeps
-    focus_calls = scan["max_focus_windows"] * per_window * focus_polls
+    if scan["mode"] == "scheduled":
+        sweeps = float(scan["sweeps_per_day"])
+        focus_polls = float(scan["polls_per_day"])
+    else:
+        sweeps = 24 / scan["sweep_interval_hours"]
+        focus_polls = (24 * 60) / scan["focus_interval_minutes"] - sweeps
+    per_sweep = len(chunks) * per_window
+    per_poll = scan["max_focus_windows"] * per_window
+    sweep_calls = per_sweep * sweeps
+    focus_calls = per_poll * focus_polls
     return {
-        "windows": len(chunks), "sweeps": sweeps, "focus_polls": focus_polls,
-        "cap": cap, "measured": measured, "per_window": per_window,
+        "mode": scan["mode"], "windows": len(chunks), "sweeps": sweeps,
+        "focus_polls": focus_polls, "cap": cap, "measured": measured,
+        "per_window": per_window, "per_sweep": per_sweep, "per_poll": per_poll,
         "sweep_calls": sweep_calls, "focus_calls": focus_calls,
         "planned": sweep_calls + focus_calls, "stats": stats,
     }
@@ -1202,7 +1243,13 @@ def show_budget(cfg: dict, store: Store) -> None:
     p = budget_plan(cfg, store)
     h, scan, api = cfg["horizon"], cfg["scan"], cfg["api"]
     codes, sources = query_plan(cfg)
-    print(f"\nHorizon     {h['min_days_out']} to {h['max_days_out']} days out, "
+    if p["mode"] == "scheduled":
+        print(f"\nMode        scheduled, GitHub Actions runs --once {p['focus_polls']:.0f} "
+              f"times and --sweep {p['sweeps']:.0f} times a day")
+    else:
+        print(f"\nMode        loop, one process sweeping every {scan['sweep_interval_hours']}h "
+              f"and polling every {scan['focus_interval_minutes']}min")
+    print(f"Horizon     {h['min_days_out']} to {h['max_days_out']} days out, "
           f"{p['windows']} windows of {h['chunk_days']} days")
     print(f"Per call    cabins {''.join(codes)}, {len(sources)} sources, "
           f"{api['page_size']} rows per page, up to {api['max_pages_per_query']} pages")
@@ -1215,10 +1262,12 @@ def show_budget(cfg: dict, store: Store) -> None:
     else:
         print("Pagination  not measured yet, assuming one page per direction "
               "(2 calls per window). Run --sweep to measure.")
-    print(f"Sweeps      {p['sweeps']:.0f}/day x {p['windows']} windows x "
-          f"{p['per_window']:.2f} calls = {p['sweep_calls']:.0f} calls")
-    print(f"Focus       {p['focus_polls']:.0f}/day x {scan['max_focus_windows']} windows x "
-          f"{p['per_window']:.2f} calls = {p['focus_calls']:.0f} calls")
+    print(f"Per sweep   {p['windows']} windows x {p['per_window']:.2f} calls = "
+          f"{p['per_sweep']:.0f} calls")
+    print(f"Per poll    {scan['max_focus_windows']} focus windows x {p['per_window']:.2f} calls = "
+          f"{p['per_poll']:.0f} calls")
+    print(f"Sweeps      {p['sweeps']:.0f}/day x {p['per_sweep']:.0f} = {p['sweep_calls']:.0f} calls")
+    print(f"Polls       {p['focus_polls']:.0f}/day x {p['per_poll']:.0f} = {p['focus_calls']:.0f} calls")
     print(f"Planned     {p['planned']:.0f} of {p['cap']} usable "
           f"({api['daily_call_budget']} cap minus {api['budget_safety_margin']} margin)")
     used = store.calls_today()
@@ -1229,11 +1278,13 @@ def show_budget(cfg: dict, store: Store) -> None:
         line += f", {header} reports {quota} left"
     print(line)
     if p["planned"] > p["cap"]:
-        print("\nOVER BUDGET. Raise horizon.chunk_days, scan.sweep_interval_hours "
-              "or scan.focus_interval_minutes, then run --budget again.")
+        fix = ("Raise horizon.chunk_days or lower scan.max_focus_windows"
+               if p["mode"] == "scheduled" else
+               "Raise horizon.chunk_days, scan.sweep_interval_hours or scan.focus_interval_minutes")
+        print(f"\nOVER BUDGET. {fix}, then run --budget again.")
     elif p["measured"] and p["per_window"] > 2.5:
         print("\nPagination is eating the margin. Lower horizon.chunk_days so each "
-              "query covers fewer dates, or raise scan.focus_interval_minutes.")
+              "query covers fewer dates, or poll less often.")
     print()
 
 
@@ -1432,12 +1483,15 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    """Stands in for requests.Session. Records every call it receives."""
-    def __init__(self, pages: list[_FakeResponse]):
-        self.pages, self.calls = list(pages), []
+    """Stands in for requests.Session. Records every call it receives. With
+    repeat_last the final page answers every call after the list runs out."""
+    def __init__(self, pages: list[_FakeResponse], repeat_last: bool = False):
+        self.pages, self.calls, self.repeat_last = list(pages), [], repeat_last
 
     def get(self, url: str, params: dict | None = None, timeout: float = 0) -> _FakeResponse:
         self.calls.append((url, dict(params or {})))
+        if len(self.pages) == 1 and self.repeat_last:
+            return self.pages[0]
         return self.pages.pop(0)
 
 
@@ -1670,7 +1724,56 @@ def self_test() -> None:
     with redirect_stdout(buf):
         show_budget(cfg, store)
     assert "measured 2.60 calls per window" in buf.getvalue(), buf.getvalue()
-    print("budget ok: plan multiplies by measured calls per window")
+    assert plan["mode"] == "loop" and plan["sweeps"] == 4 and plan["focus_polls"] == 92
+    print("budget ok: loop plan multiplies by measured calls per window")
+
+    # -- budget in scheduled mode ---------------------------------------------
+    sched = copy.deepcopy(cfg)
+    sched["scan"].update({"mode": "scheduled", "polls_per_day": 48, "sweeps_per_day": 4})
+    plan = budget_plan(sched, store)
+    close = math.isclose
+    assert close(plan["per_sweep"], 26) and close(plan["per_poll"], 7.8), plan
+    assert close(plan["sweep_calls"], 104) and close(plan["focus_calls"], 374.4), plan
+    assert close(plan["planned"], 478.4) and plan["planned"] < 900, plan
+    fresh_plan = budget_plan(sched, Store(":memory:"))
+    assert fresh_plan["planned"] == 4 * 20 + 48 * 6, fresh_plan
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        show_budget(sched, store)
+    out = buf.getvalue()
+    assert "Mode        scheduled" in out and "--once 48 times" in out and "Polls       48/day" in out, out
+    _expect_fail(broken(lambda r: r["scan"].update({"mode": "cron"})), "scan.mode")
+    print(f"budget ok: scheduled plan is {plan['planned']:.0f} calls a day at measured pagination")
+
+    # -- prune runs at the end of --sweep and --once --------------------------
+    for label, runner in (("sweep", run_sweep), ("once", run_focus)):
+        pst = Store(":memory:")
+        stale = (now_dt - timedelta(days=500)).isoformat()
+        pst.record_legs([
+            Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, stale, stale),
+            Leg("s", "delta", "JFK", "SYD", "2027-03-02", "Y", 30000, 66.0, 4, "DL", False, now, now),
+        ])
+        pst.set_state("focus_dates", ["2027-03-14"])
+        pcl = SeatsAero(cfg, pst, api_key="test-key")
+        pcl.session = _FakeSession([_FakeResponse({"data": [], "hasMore": False})], repeat_last=True)
+        with redirect_stdout(io.StringIO()):
+            runner(cfg, pst, pcl, True)
+        left = pst.conn.execute("SELECT observed_at FROM observations").fetchall()
+        assert [r[0] for r in left] == [now], f"{label} kept {left}"
+        assert pst.calls_today() == (20 if label == "sweep" else 2), pst.calls_today()
+    print("prune ok: --sweep and --once both drop rows past retention and keep the rest")
+
+    # -- leaderboard fenced for a job summary ---------------------------------
+    os.environ["GITHUB_ACTIONS"] = "true"
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            show_best(cfg, store, cabin="Y")
+    finally:
+        del os.environ["GITHUB_ACTIONS"]
+    lines = buf.getvalue().strip().splitlines()
+    assert lines[0] == "```" and lines[-1] == "```", lines[:2]
+    print("summary ok: --best fences its table under GitHub Actions")
 
     # -- calibration --------------------------------------------------------
     cals = calibrate(cfg, store)
@@ -1802,7 +1905,6 @@ def main() -> None:
                     run_sweep(cfg, store, client, args.dry_run)
                 else:
                     run_focus(cfg, store, client, args.dry_run)
-                store.prune(cfg["storage"]["retain_observation_days"])
             except Exception:
                 LOG.exception("Cycle failed, continuing")
             time.sleep(interval)

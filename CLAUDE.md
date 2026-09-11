@@ -46,6 +46,15 @@ calibration, self test, main.
   back, so `--budget` reflects measured pagination.
 - `RoundTrip.cabin` is the cabin a trip ranks under. Mixed pairings, only
   possible when `trip.allow_mixed_cabin` is true, rank under the lower cabin.
+- `scan.mode` is `loop` or `scheduled`. Scheduled mode is GitHub Actions
+  running `--sweep` and `--once` on the crons in `.github/workflows`, with
+  the database kept on the `monitor-state` branch. `budget_plan` prices the
+  day from `polls_per_day` and `sweeps_per_day` in that mode. `run_sweep` and
+  `run_focus` both call `prune_history` on the way out, because scheduled
+  mode never enters the loop.
+- Never commit `.env` or the database. Credentials are repository secrets.
+  The workflow files are Eric's, reviewed outside the repo. Don't rework the
+  restore, save, concurrency or alert-if-down logic without asking.
 
 ## What is verified and what is not
 

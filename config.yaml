@@ -26,9 +26,19 @@ horizon:
   chunk_days: 31
 
 scan:
-  # Full calendar sweep, both directions, every N hours.
+  # loop       monitor.py --loop as a long-running service
+  # scheduled  GitHub Actions runs --sweep and --once on the crons in
+  #            .github/workflows and keeps the database on the monitor-state
+  #            branch between runs
+  # --budget plans the day differently for each.
+  mode: scheduled
+  # Scheduled mode only. Mirror the crons in .github/workflows. focus-poll.yml
+  # runs at :07 and :37, full-sweep.yml runs four times a day.
+  polls_per_day: 48
+  sweeps_per_day: 4
+  # Loop mode only. Full calendar sweep, both directions, every N hours.
   sweep_interval_hours: 6
-  # Focused re-poll of the months around each cabin's best combination.
+  # Loop mode only. Focused re-poll of each cabin's best months.
   focus_interval_minutes: 15
   # Focus windows go to the top date of each cabin first (Y, W, J, F), then
   # fill by global rank. Four cabins and three windows means the fourth cabin

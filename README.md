@@ -257,7 +257,35 @@ a headline number is real for a party of four.
 than USD, the `max_total_taxes_usd` cap is comparing unlike units for that
 program. `--stats` will show you which programs are in play.
 
+## Hosting on GitHub Actions
+
+`config.yaml` ships with `scan.mode: scheduled`. Three workflows under
+`.github/workflows` run the monitor without a server.
+
+- `probe.yml` is manual. One live call, prints the reconciliation table.
+- `focus-poll.yml` runs `--once` at :07 and :37 every hour.
+- `full-sweep.yml` runs `--sweep` at :17 every six hours.
+
+The database lives on an orphan branch called `monitor-state`. Each run
+restores it, works, then force-pushes it back. A run refuses to start on a
+blank database if that branch exists but can't be read, so a transient git
+error can't wipe the price history. Both scheduled workflows share one
+concurrency group so they never write state at the same time, and a separate
+job sends a Pushover message if a run fails or times out.
+
+Every sweep and focus poll prunes observations past
+`storage.retain_observation_days` on its way out, since scheduled mode never
+enters the loop. `--best` fences its table in a code block when it runs under
+Actions so the job summary keeps its columns.
+
+Schedules only fire from the default branch. `--budget` in scheduled mode
+prices the day as `polls_per_day` focus polls plus `sweeps_per_day` sweeps,
+both mirrored from the crons, times the pagination measured on the last sweep.
+Credentials live in repository secrets, never in the repo.
+
 ## systemd
+
+For `scan.mode: loop` on a machine of your own.
 
 `/etc/systemd/system/award-monitor.service`
 
