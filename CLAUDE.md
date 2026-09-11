@@ -111,8 +111,10 @@ constant and the self test asserts it appears.
 
 **API budget is 1,000 calls a day, hard.** Run `--budget` after any change to
 `horizon`, `scan`, `cabins` or `trips`. Adding a cabin adds no calls but adds
-rows, which adds pages. Adding a trip adds a full set of calls. Four trips
-plan at 736 of 900 before pagination with the 360 day horizon. Every sweep measures calls per window and `--budget`
+rows, which adds pages. Adding a trip adds a full set of calls. Europe returns
+four thousand legs a window and needs seven calls where the others need
+two, so polls are hourly and sweeps three a day. Four trips plan at 741 of
+900 at the measured 3.25 calls per window. Every sweep measures calls per window and `--budget`
 multiplies by that. If it climbs past about 2.5, lower `chunk_days` or raise
 `focus_interval_minutes`. `budget_safety_margin` exists so a manual `--once`
 never trips the cap.
@@ -128,8 +130,17 @@ seats.aero's crawl, not the poll interval. Do not add a live search call path.
   `self_test()` instead. `--probe` is the one sanctioned live diagnostic and
   it costs one call.
 - No new dependencies beyond `requests` and `pyyaml` without asking.
-- SQLite keeps every observation as a tick rather than upserting. The price
-  history is what makes `--calibrate` possible. Do not switch to upsert.
+- SQLite keeps a tick for every change. A leg that is new or whose price,
+  taxes, seats, airlines or routing changed gets a row. An unchanged leg
+  only refreshes `last_confirmed_at` on its latest tick. The price history
+  is complete, every change is a row, and freshness reads from
+  `last_confirmed_at`. Don't switch to an upsert that overwrites price, and
+  don't go back to a row per sighting without `storage.record_unchanged`,
+  four trips are eighty thousand legs a sweep on a database that lives on a
+  git branch.
+- The database is force-pushed to `monitor-state` every run. At four trips
+  it is tens of megabytes. `prune` runs `VACUUM` so the file shrinks. If the
+  repo's size becomes a problem, move state to a release asset.
 - Thresholds are never written to `config.yaml` by code. `--calibrate` prints
   a block to paste.
 

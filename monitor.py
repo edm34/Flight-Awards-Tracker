@@ -343,6 +343,7 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
     scan.setdefault("sweeps_per_day", 4)
     scan.setdefault("polls_per_day", 48)
     scan.setdefault("max_focus_windows", 4)
+    scan.setdefault("focus_pad_days", 10)
 
     api = cfg["api"]
     api.setdefault("budget_safety_margin", 0)
@@ -395,7 +396,8 @@ CREATE TABLE IF NOT EXISTS observations (
     airlines TEXT,
     direct INTEGER,
     last_seen TEXT,
-    observed_at TEXT NOT NULL
+    observed_at TEXT NOT NULL,
+    last_confirmed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_obs_fp ON observations(fingerprint, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_date ON observations(depart_date, miles);
@@ -456,6 +458,9 @@ class Store:
         if "taxes_currency" not in cols:
             self.conn.execute(
                 "ALTER TABLE observations ADD COLUMN taxes_currency TEXT NOT NULL DEFAULT 'USD'")
+        if "last_confirmed_at" not in cols:
+            self.conn.execute("ALTER TABLE observations ADD COLUMN last_confirmed_at TEXT")
+            self.conn.execute("UPDATE observations SET last_confirmed_at = observed_at")
 
     # -- state ------------------------------------------------------------
     def get_state(self, key: str, default: Any = None) -> Any:
@@ -470,36 +475,66 @@ class Store:
         self.conn.commit()
 
     # -- observations -----------------------------------------------------
-    def record_legs(self, legs: Iterable[Leg]) -> int:
-        rows = [
-            (
-                leg.fingerprint(), leg.availability_id, leg.source, leg.origin,
-                leg.destination, leg.depart_date, leg.cabin, leg.miles,
-                leg.taxes_usd, leg.taxes_currency, leg.seats, leg.airlines,
-                int(leg.direct), leg.last_seen, leg.observed_at,
+    def record_legs(self, legs: Iterable[Leg], record_unchanged: bool = False) -> tuple[int, int]:
+        """Store what a scan saw. A leg that is new, or whose price, taxes,
+        seats, airlines or routing changed since its latest tick, gets a new
+        tick. A leg that is exactly as last seen only has last_confirmed_at
+        touched on its latest tick. The price history stays complete, every
+        change is a row, without a copy of every unchanged row every half
+        hour. Four trips of a year are eighty thousand legs a sweep and the
+        database lives on a git branch. record_unchanged restores a tick per
+        sighting. Returns (ticks written, ticks touched)."""
+        legs = list(legs)
+        if not legs:
+            return 0, 0
+        wanted = {leg.fingerprint(): leg for leg in legs}
+        latest: dict[str, sqlite3.Row] = {}
+        if not record_unchanged:
+            for r in self.conn.execute(
+                    """SELECT o.id, o.fingerprint, o.miles, o.taxes_usd, o.seats, o.airlines, o.direct
+                       FROM observations o
+                       JOIN (SELECT fingerprint, MAX(id) AS mid FROM observations GROUP BY fingerprint) l
+                         ON o.id = l.mid"""):
+                if r["fingerprint"] in wanted:
+                    latest[r["fingerprint"]] = r
+        inserts, touches = [], []
+        for fp, leg in wanted.items():
+            cur = latest.get(fp)
+            if cur is not None and (cur["miles"], cur["taxes_usd"], cur["seats"], cur["airlines"] or "",
+                                    bool(cur["direct"])) == (leg.miles, leg.taxes_usd, leg.seats,
+                                                             leg.airlines, leg.direct):
+                touches.append((leg.observed_at, leg.last_seen, cur["id"]))
+                continue
+            inserts.append((
+                fp, leg.availability_id, leg.source, leg.origin, leg.destination,
+                leg.depart_date, leg.cabin, leg.miles, leg.taxes_usd, leg.taxes_currency,
+                leg.seats, leg.airlines, int(leg.direct), leg.last_seen, leg.observed_at,
+                leg.observed_at,
+            ))
+        if inserts:
+            self.conn.executemany(
+                """INSERT INTO observations
+                   (fingerprint, availability_id, source, origin, destination,
+                    depart_date, cabin, miles, taxes_usd, taxes_currency, seats,
+                    airlines, direct, last_seen, observed_at, last_confirmed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                inserts,
             )
-            for leg in legs
-        ]
-        self.conn.executemany(
-            """INSERT INTO observations
-               (fingerprint, availability_id, source, origin, destination,
-                depart_date, cabin, miles, taxes_usd, taxes_currency, seats,
-                airlines, direct, last_seen, observed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            rows,
-        )
+        if touches:
+            self.conn.executemany(
+                "UPDATE observations SET last_confirmed_at = ?, last_seen = ? WHERE id = ?", touches)
         self.conn.commit()
-        return len(rows)
+        return len(inserts), len(touches)
 
     def latest_legs(self, max_age_hours: float) -> list[Leg]:
         """Most recent observation per fingerprint, within the freshness window."""
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
         rows = self.conn.execute(
             """SELECT o.* FROM observations o
-               JOIN (SELECT fingerprint, MAX(id) AS mid
-                     FROM observations WHERE observed_at >= ?
+               JOIN (SELECT fingerprint, MAX(id) AS mid FROM observations
                      GROUP BY fingerprint) latest
-                 ON o.id = latest.mid""",
+                 ON o.id = latest.mid
+               WHERE COALESCE(o.last_confirmed_at, o.observed_at) >= ?""",
             (cutoff,),
         ).fetchall()
         return [_row_to_leg(r) for r in rows]
@@ -515,9 +550,10 @@ class Store:
         return [_row_to_leg(r) for r in rows]
 
     def history_span(self) -> dict[str, tuple[str, str, int]]:
-        """Per cabin, first and last observation time and tick count."""
+        """Per cabin, first sighting, last confirmation and tick count."""
         rows = self.conn.execute(
-            """SELECT cabin, MIN(observed_at) AS first, MAX(observed_at) AS last,
+            """SELECT cabin, MIN(observed_at) AS first,
+                      MAX(COALESCE(last_confirmed_at, observed_at)) AS last,
                       COUNT(*) AS n FROM observations GROUP BY cabin"""
         ).fetchall()
         return {r["cabin"]: (r["first"], r["last"], r["n"]) for r in rows}
@@ -592,9 +628,12 @@ class Store:
 
     def prune(self, days: int) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        cur = self.conn.execute("DELETE FROM observations WHERE observed_at < ?", (cutoff,))
+        cur = self.conn.execute(
+            "DELETE FROM observations WHERE COALESCE(last_confirmed_at, observed_at) < ?", (cutoff,))
         self.conn.execute("DELETE FROM snapshots WHERE at < ?", (cutoff,))
         self.conn.commit()
+        if cur.rowcount:
+            self.conn.execute("VACUUM")
         return cur.rowcount
 
 
@@ -620,7 +659,7 @@ def horizon_chunks(cfg: dict, today: date | None = None) -> list[tuple[str, str]
     return chunks
 
 
-def month_window(day: str, pad_days: int = 20) -> tuple[str, str]:
+def month_window(day: str, pad_days: int = 10) -> tuple[str, str]:
     d = datetime.strptime(day, "%Y-%m-%d").date()
     return ((d - timedelta(days=pad_days)).isoformat(),
             (d + timedelta(days=pad_days)).isoformat())
@@ -1065,7 +1104,7 @@ def fetch_window(client: SeatsAero, store: Store, cfg: dict, trip: dict,
                            (trip["destinations"], cfg["origins"])):
         res = client.cached_search(origins, dests, codes, sources, start, end)
         legs = [leg for obj in res.rows for leg in parse_availability(obj, codes)]
-        store.record_legs(legs)
+        store.record_legs(legs, cfg["storage"].get("record_unchanged", False))
         legs_total += len(legs)
         calls += res.calls
         capped = capped or res.capped
@@ -1182,8 +1221,9 @@ def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
         run_sweep(cfg, store, client, dry_run)
         return
     calls_total = 0
+    pad = cfg["scan"].get("focus_pad_days", 10)
     for w in windows:
-        start, end = month_window(w["date"])
+        start, end = month_window(w["date"], pad)
         _, calls, _ = fetch_window(client, store, cfg, cfg["trips"][w["trip"]], start, end)
         calls_total += calls
     LOG.info("Focus poll of %d windows done in %d calls, %d calls left",
@@ -2299,6 +2339,25 @@ def self_test() -> None:
     out = _quiet(show_budget, sched, store)
     assert "Mode        scheduled" in out and "= 20 windows" in out and "measured 2.60 calls" in out, out
     print(f"budget ok: scheduled plan is {plan['planned']:.0f} calls a day for 2 trips at measured pagination")
+
+    # -- a tick only when something changed -----------------------------------
+    tick = Store(":memory:")
+    old = (now_dt - timedelta(hours=20)).isoformat()
+    base = Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, old, old)
+    assert tick.record_legs([base]) == (1, 0)
+    again = Leg(**dict(asdict(base), observed_at=now, last_seen=now))
+    assert tick.record_legs([again]) == (0, 1), "same price and seats touches the latest tick"
+    assert tick.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+    assert [l.observed_at for l in tick.latest_legs(12)] == [old], "confirmed just now, so still fresh"
+    cheaper = Leg(**dict(asdict(base), miles=27000, observed_at=now, last_seen=now))
+    assert tick.record_legs([cheaper]) == (1, 0), "a price change is a new tick"
+    assert tick.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+    assert [l.miles for l in tick.latest_legs(12)] == [27000]
+    fewer = Leg(**dict(asdict(cheaper), seats=1))
+    assert tick.record_legs([fewer, fewer]) == (1, 0), "a seat change is a new tick, duplicates in a batch collapse"
+    assert tick.record_legs([fewer], record_unchanged=True) == (1, 0), "record_unchanged restores a tick per sighting"
+    assert tick.record_legs([]) == (0, 0)
+    print("ticks ok: new or changed legs are rows, unchanged legs only refresh last_confirmed_at")
 
     # -- prune runs at the end of --sweep and --once --------------------------
     for label, runner in (("sweep", run_sweep), ("once", run_focus)):

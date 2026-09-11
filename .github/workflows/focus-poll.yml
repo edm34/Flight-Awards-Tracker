@@ -1,20 +1,19 @@
 name: focus-poll
 
 # Re-polls the months around the current best combinations.
-# Every 30 minutes keeps the private-repo free tier at roughly 1,560 of the
-# 2,000 monthly minutes. Do not tighten this to every 15 minutes without
-# checking billing, and see the note in BUILD-HOSTING.md about why 30 is not
-# really slower.
+# Hourly. With four trips, Europe alone needs seven API calls a window, and
+# half-hourly polling planned past the 1,000 call daily cap. Hourly keeps the
+# day near 750 calls and the free tier near 800 of the 2,000 monthly minutes.
+# Mirror any change here in scan.polls_per_day in config.yaml.
 #
-# Runs at :07 and :37, not :00 and :30. The top of the hour is when GitHub's
-# scheduler is most delayed, and :00 is also when full-sweep used to fire,
-# which put both runs into the concurrency queue at the same moment.
+# Runs at :07, not :00. The top of the hour is when GitHub's scheduler is
+# most delayed, and full-sweep fires at :17 so the two never queue together.
 #
 # Scheduled triggers only fire from the DEFAULT branch. This file does nothing
 # on a feature branch until it is merged.
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
 
 # Shared with full-sweep.yml so the two can never write state at the same time.

@@ -223,16 +223,17 @@ at 3am while a business observation waits until morning.
 Two modes share one budget.
 
 **Sweep** walks the full horizon in 31 day windows, every trip, both
-directions. Eleven date ranges times four trips is 44 windows, two calls each,
-four times a day.
+directions. Eleven date ranges times four trips is 44 windows, three times a
+day. Europe returns about four thousand legs a window and needs seven calls
+where the other trips need two, so a sweep is about 143 calls.
 
-**Focus** re-polls the months around the best combinations. Every trip's
-economy top first, then every trip's premium top, and so on, capped at
-`max_focus_windows`, every 30 minutes on the schedule.
+**Focus** re-polls `focus_pad_days` either side of the best dates. Every
+trip's economy top first, then every trip's premium top, and so on, capped
+at `max_focus_windows`, hourly on the schedule.
 
 Every sweep records how many calls each window actually took and `--budget`
-multiplies the plan by that measured figure. Four trips plan at 736 of 900
-usable calls a day before pagination.
+multiplies the plan by that measured figure. Four trips plan at 741 of 900
+usable calls a day at the measured 3.25 calls per window.
 
 ## Hosting on GitHub Actions
 
@@ -240,11 +241,13 @@ usable calls a day before pagination.
 `.github/workflows` run the monitor without a server.
 
 - `probe.yml` is manual. One live call, prints the reconciliation table.
-- `focus-poll.yml` runs `--once` at :07 and :37 every hour.
-- `full-sweep.yml` runs `--sweep` at :17 every six hours.
+- `focus-poll.yml` runs `--once` hourly at :07.
+- `full-sweep.yml` runs `--sweep` at :17 every eight hours.
 
 The database and `dashboard.json` live on an orphan branch called
-`monitor-state`. Each run restores them, works, then force-pushes them back. A
+`monitor-state`. A leg gets a new row only when it is new or something about
+it changed, and an unchanged leg refreshes its `last_confirmed_at`, so the
+history stays complete without eighty thousand duplicate rows a sweep. Each run restores them, works, then force-pushes them back. A
 run refuses to start on a blank database if that branch exists but can't be
 read. Both scheduled workflows share one concurrency group, and a separate job
 sends a Pushover message if a run fails or times out. Every run prunes
