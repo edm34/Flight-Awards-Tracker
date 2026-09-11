@@ -43,41 +43,34 @@ export PUSHOVER_APP_TOKEN="..."
 python monitor.py --self-test     # offline, no network, no API calls
 python monitor.py --budget        # confirms the call plan fits
 python monitor.py --test-alert    # proves the Pushover wiring
-python monitor.py --probe         # one live call, dumps the raw response
+python monitor.py --probe         # one live call, reconciles the parser
 python monitor.py --sweep --dry-run --verbose   # first real scan
 ```
 
 ## First live run
 
-Nobody has run this against the real seats.aero API yet. The parser follows the
-published Availability schema and two open source client libraries, but four
-things still need a human with a key to confirm. `--probe` makes exactly one
-call and prints everything needed to do that.
+The parser was reconciled against a live response on 11 Sep 2026 by `--probe`,
+which makes exactly one call and prints the raw object, every response header
+and a field by field table. What it confirmed:
 
-1. **Field names.** The probe prints the first raw object and a reconciliation
-   table with `ok` or `MISSING` next to every field the parser reads. Mileage
-   comes from `<cabin>MileageCostRaw` when present and the string
-   `<cabin>MileageCost` otherwise. `ComputedLastSeen` may be absent, in which
-   case `UpdatedAt` is used.
-2. **Tax units.** `<cabin>TotalTaxes` is treated as the minor unit of
-   `TaxesCurrency`, so 6625 becomes $66.25. Compare the probe's parsed taxes
-   for one row against delta.com. If they are off by 100x, remove the division
-   in `parse_availability`.
-3. **Pagination.** seats.aero pages with the `cursor` from the first response
-   and a `skip` equal to the rows already received. When a response carries a
-   `moreURL` the monitor follows that instead. The probe prints `count`,
-   `hasMore`, `cursor` and `moreURL` so you can see which shape you get.
-4. **Quota header.** Three candidate header names are tried. The probe prints
-   every response header and marks the one that matched. `--budget` reports
-   the remaining quota from it afterwards.
+- Field names. `ID`, `Route.OriginAirport`, `Source`, `Date`, `UpdatedAt`,
+  `TaxesCurrency`, and per cabin `Available`, `MileageCost` as a string of
+  digits, `RemainingSeats`, `TotalTaxes`, `Airlines`, `Direct`. There is no
+  `ComputedLastSeen`. Every cabin field also has a `Raw` twin holding the
+  value before seats.aero's own quality filter. The parser reads the filtered
+  set, which is what the site shows.
+- Tax units. `TotalTaxes` is the minor unit of `TaxesCurrency`. The probe row
+  was a Qantas economy seat on Emirates metal at 40860, which is $408.60 and
+  plausible for that carrier's surcharges. Delta rows should land near $66.
+- Pagination. Responses carry `count`, `hasMore`, `cursor` and a ready-made
+  `moreURL`. The monitor follows `moreURL` and falls back to the cursor plus
+  skip protocol only if it is absent.
+- Quota. `x-ratelimit-remaining` counts down from `x-ratelimit-limit: 1000`.
+  `--budget` shows the remaining figure from the last call.
+- The cabin filter is the `cabins` parameter with word values
+  (`economy,premium,business,first`).
 
-The cabin filter sends word values (`economy,premium,business,first`) rather
-than the letter codes used in field names. If the probe returns HTTP 400,
-that is the first thing to check.
-
-Also note which cabins come back populated. The probe counts rows with
-availability per cabin. A program returning nothing in first class is normal,
-not a parser bug.
+Run `--probe` again after any parser change. It costs one call.
 
 ## How it scans
 

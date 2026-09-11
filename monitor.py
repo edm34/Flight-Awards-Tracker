@@ -57,14 +57,13 @@ CABIN_ORDER = ("Y", "W", "J", "F")
 CABIN_NAMES = {"Y": "Economy", "W": "Premium Economy", "J": "Business", "F": "First"}
 
 # seats.aero names its response fields with one letter cabin codes but filters
-# rows with word values. Confirmed against two public client libraries, not
-# against a live call. --probe prints the HTTP status if this turns out wrong.
+# rows with word values under a "cabins" parameter. Both confirmed live on
+# 11 Sep 2026, the server's own moreURL spells it this way.
 CABIN_QUERY_VALUES = {"Y": "economy", "W": "premium", "J": "business", "F": "first"}
 
-# Candidate daily quota headers. requests matches header names case
-# insensitively, so these three cover the variants seen in the wild. The one
-# that actually matches is remembered in state and shown by --budget.
-QUOTA_HEADERS = ("x-ratelimit-remaining", "x-quota-remaining", "ratelimit-remaining")
+# Daily quota header, confirmed live. The API also sends x-ratelimit-limit
+# (1000) and x-ratelimit-reset (seconds until the UTC midnight reset).
+QUOTA_HEADER = "x-ratelimit-remaining"
 
 # --calibrate refuses to propose thresholds on thinner history than this.
 CALIBRATE_MIN_COMBOS = 200
@@ -545,7 +544,7 @@ class SeatsAero:
         return {
             "origin_airport": ",".join(origins),
             "destination_airport": ",".join(destinations),
-            "cabin": ",".join(CABIN_QUERY_VALUES[c] for c in cabins),
+            "cabins": ",".join(CABIN_QUERY_VALUES[c] for c in cabins),
             "sources": ",".join(sources),
             "start_date": start_date,
             "end_date": end_date,
@@ -563,16 +562,14 @@ class SeatsAero:
         return resp
 
     def _quota_from(self, resp: requests.Response) -> int | None:
-        for header in QUOTA_HEADERS:
-            if header in resp.headers:
-                if self.store.get_state("quota_header") != header:
-                    LOG.info("Quota header is %s", header)
-                    self.store.set_state("quota_header", header)
-                try:
-                    return int(resp.headers[header])
-                except ValueError:
-                    return None
-        return None
+        if QUOTA_HEADER not in resp.headers:
+            return None
+        if self.store.get_state("quota_header") != QUOTA_HEADER:
+            self.store.set_state("quota_header", QUOTA_HEADER)
+        try:
+            return int(resp.headers[QUOTA_HEADER])
+        except ValueError:
+            return None
 
     def cached_search(self, origins: list[str], destinations: list[str],
                       cabins: list[str], sources: list[str],
@@ -653,17 +650,18 @@ def _to_int(value: Any) -> int:
 def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
     """One seats.aero Availability object into one Leg per populated cabin.
 
-    Field names follow the published Availability schema. Mileage comes from
-    the integer <cabin>MileageCostRaw when present and the string
-    <cabin>MileageCost otherwise. <cabin>TotalTaxes is an integer in the minor
-    unit of TaxesCurrency, so it is divided by 100. Confirm that one row
-    against delta.com on the first live run, see --probe."""
+    Field names were reconciled against a live response on 11 Sep 2026.
+    <cabin>MileageCost is a string of digits, <cabin>TotalTaxes an integer in
+    the minor unit of TaxesCurrency (40860 USD is $408.60), UpdatedAt is the
+    freshness stamp. Every field also has a *Raw twin holding the value
+    before seats.aero's own quality filter. The parser reads the filtered
+    set, which is what the seats.aero site shows."""
     route = obj.get("Route") or {}
-    origin = route.get("OriginAirport") or obj.get("OriginAirport") or ""
-    destination = route.get("DestinationAirport") or obj.get("DestinationAirport") or ""
+    origin = route.get("OriginAirport") or ""
+    destination = route.get("DestinationAirport") or ""
     source = obj.get("Source") or route.get("Source") or "unknown"
     depart_date = (obj.get("Date") or "")[:10]
-    last_seen = obj.get("ComputedLastSeen") or obj.get("UpdatedAt") or ""
+    last_seen = obj.get("UpdatedAt") or ""
     currency = obj.get("TaxesCurrency") or "USD"
     now = datetime.now(timezone.utc).isoformat()
 
@@ -671,9 +669,7 @@ def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
     for cabin in cabins:
         if not obj.get(f"{cabin}Available"):
             continue
-        miles = _to_int(obj.get(f"{cabin}MileageCostRaw"))
-        if miles <= 0:
-            miles = _to_int(obj.get(f"{cabin}MileageCost"))
+        miles = _to_int(obj.get(f"{cabin}MileageCost"))
         if miles <= 0:
             continue
         legs.append(Leg(
@@ -1022,16 +1018,15 @@ def run_probe(cfg: dict, client: SeatsAero) -> None:
         return
     print(f"\nHTTP {resp.status_code} in {time.monotonic() - t0:.2f}s")
     print("Response headers")
-    matched = next((h for h in QUOTA_HEADERS if h in resp.headers), None)
     for k, v in resp.headers.items():
-        tag = "   <- daily quota" if matched and k.lower() == matched else ""
+        tag = "   <- daily quota" if k.lower() == QUOTA_HEADER else ""
         print(f"  {k}: {v}{tag}")
-    if not matched:
-        print("  (no header in QUOTA_HEADERS matched, pick the right one from the list above)")
+    if QUOTA_HEADER not in resp.headers:
+        print(f"  ({QUOTA_HEADER} not present, budget tracking will run blind)")
     if resp.status_code != 200:
         print(f"\nBody: {resp.text[:800]}")
         print("\nA 400 here usually means a query value is wrong. "
-              "The cabin filter sends word values, see CABIN_QUERY_VALUES.")
+              "The cabins filter sends word values, see CABIN_QUERY_VALUES.")
         return
 
     body = resp.json()
@@ -1055,15 +1050,14 @@ def run_probe(cfg: dict, client: SeatsAero) -> None:
         ("Route.DestinationAirport", route.get("DestinationAirport")),
         ("Source", obj.get("Source")),
         ("Date", obj.get("Date")),
-        ("ComputedLastSeen", obj.get("ComputedLastSeen")),
         ("UpdatedAt", obj.get("UpdatedAt")),
         ("TaxesCurrency", obj.get("TaxesCurrency")),
     ]
     for name, val in checks:
         print(f"  {name:26} {'ok' if val not in (None, '') else 'MISSING':8} {val!r}")
     for code in CABIN_ORDER:
-        fields = ["Available", "MileageCost", "MileageCostRaw", "RemainingSeats",
-                  "TotalTaxes", "Airlines", "Direct"]
+        fields = ["Available", "MileageCost", "RemainingSeats", "TotalTaxes",
+                  "Airlines", "Direct"]
         bits = []
         for f in fields:
             key = f"{code}{f}"
@@ -1537,25 +1531,30 @@ def self_test() -> None:
 
     # -- parsing ------------------------------------------------------------
     def av(oid, source, o, d, day, **cabins):
+        """An Availability object in the exact shape the live API returned on
+        11 Sep 2026. Every cabin field has a *Raw twin and a Direct variant,
+        MileageCost is a string, UpdatedAt is the freshness stamp."""
         obj = {
-            "ID": oid, "Source": source, "Date": day, "TaxesCurrency": "USD",
-            "Route": {"OriginAirport": o, "DestinationAirport": d, "Source": source},
-            "ComputedLastSeen": now,
+            "ID": oid, "RouteID": f"r-{oid}", "Source": source, "Date": day,
+            "ParsedDate": f"{day}T00:00:00Z", "TaxesCurrency": "USD",
+            "Route": {"ID": f"r-{oid}", "OriginAirport": o, "OriginRegion": "",
+                      "DestinationAirport": d, "DestinationRegion": "",
+                      "Distance": 9950, "Source": source},
+            "CreatedAt": "2025-10-31T21:02:21.568283Z", "UpdatedAt": now,
+            "AvailabilityTrips": [],
         }
         for code in CABIN_ORDER:
-            obj[f"{code}Available"] = False
-            obj[f"{code}MileageCost"] = "0"
-            obj[f"{code}MileageCostRaw"] = 0
-            obj[f"{code}RemainingSeats"] = 0
-            obj[f"{code}TotalTaxes"] = 0
-            obj[f"{code}Airlines"] = ""
-        for code, (miles, seats, taxes) in cabins.items():
-            obj[f"{code}Available"] = True
-            obj[f"{code}MileageCost"] = str(miles)
-            obj[f"{code}MileageCostRaw"] = miles
-            obj[f"{code}RemainingSeats"] = seats
-            obj[f"{code}TotalTaxes"] = taxes
-            obj[f"{code}Airlines"] = "DL" if source == "delta" else "QF"
+            miles, seats, taxes = cabins.get(code, (0, 0, 0))
+            airline = ("DL" if source == "delta" else "QF") if miles else ""
+            for prefix in ("", "Direct"):
+                for suffix in ("", "Raw"):
+                    k = f"{code}{prefix}"
+                    obj[f"{k}Available{suffix}"] = bool(miles) and not prefix
+                    obj[f"{k}MileageCost{suffix}"] = (str(miles) if not suffix else miles) if not prefix else 0
+                    obj[f"{k}RemainingSeats{suffix}"] = seats if not prefix else 0
+                    obj[f"{k}TotalTaxes{suffix}"] = taxes if not prefix else 0
+                    obj[f"{k}Airlines{suffix}"] = airline if not prefix else ""
+                    obj[f"{k}{suffix}"] = False
         return obj
 
     sample = av("p1", "delta", "JFK", "SYD", "2027-02-10",
@@ -1564,12 +1563,19 @@ def self_test() -> None:
     legs = parse_availability(sample, CABIN_ORDER)
     assert [l.cabin for l in legs] == ["Y", "W", "J"], legs
     assert legs[0].miles == 33100 and legs[0].taxes_usd == 66.25 and legs[0].taxes_currency == "USD"
+    assert legs[0].last_seen == now and legs[0].airlines == "DL"
     assert legs[2].direct is True and legs[1].direct is False
-    string_only = dict(sample)
-    del string_only["YMileageCostRaw"]
-    assert parse_availability(string_only, ["Y"])[0].miles == 33100, "string fallback"
     assert parse_availability(dict(sample, YAvailable=False), ["Y"]) == []
-    print("parse ok: four cabin fields, Raw preferred over string, taxes in minor units")
+    assert parse_availability(dict(sample, YMileageCost="0"), ["Y"]) == []
+    # The one real row from the probe, trimmed to the fields the parser reads.
+    live = {"ID": "x", "Route": {"OriginAirport": "BOS", "DestinationAirport": "SYD", "Source": "qantas"},
+            "Date": "2026-10-26", "YAvailable": True, "YMileageCost": "69900",
+            "YRemainingSeats": 1, "YTotalTaxes": 40860, "YAirlines": "EK", "YDirect": False,
+            "TaxesCurrency": "USD", "Source": "qantas", "UpdatedAt": "2026-09-10T18:45:54.293483Z"}
+    leg = parse_availability(live, CABIN_ORDER)
+    assert len(leg) == 1 and leg[0].miles == 69900 and leg[0].taxes_usd == 408.60, leg
+    assert leg[0].seats == 1 and leg[0].last_seen.startswith("2026-09-10")
+    print("parse ok: live response shape, string mileage, taxes in minor units, UpdatedAt")
 
     # -- fixtures -----------------------------------------------------------
     raw = [
@@ -1691,19 +1697,21 @@ def self_test() -> None:
     res = client.cached_search(["JFK"], ["SYD"], ["Y", "J"], ["delta"], "2027-02-01", "2027-03-03")
     assert len(res.rows) == 3 and res.calls == 3 and not res.capped, (len(res.rows), res.calls)
     calls = client.session.calls
-    assert "cursor" not in calls[0][1] and calls[0][1]["cabin"] == "economy,business", calls[0]
+    assert "cursor" not in calls[0][1] and calls[0][1]["cabins"] == "economy,business", calls[0]
     assert calls[1][1]["cursor"] == 1700000000 and calls[1][1]["skip"] == 2, calls[1]
     assert calls[2][1]["cursor"] == 1700000000 and calls[2][1]["skip"] == 3, "cursor must stay the first one"
     assert store.get_state("quota_header") == "x-ratelimit-remaining"
     assert store.quota_remaining_today() == 990 and store.calls_today() == 3
 
+    more = ("/partnerapi/search?take=25&skip=25&origin_airport=JFK&destination_airport=SYD"
+            "&cursor=1789152528&start_date=2027-02-01&end_date=2027-03-03&cabins=economy&sources=delta")
     client.session = _FakeSession([
-        _FakeResponse({"data": [raw[0]], "hasMore": True, "cursor": 5,
-                       "moreURL": "/partnerapi/search?cursor=5&skip=1&x=1"}),
-        _FakeResponse({"data": [raw[1]], "hasMore": False}),
+        _FakeResponse({"data": [raw[0]], "count": 1, "hasMore": True, "cursor": 1789152528, "moreURL": more}),
+        _FakeResponse({"data": [raw[1]], "count": 1, "hasMore": False, "cursor": 1789152528, "moreURL": ""}),
     ])
     res = client.cached_search(["JFK"], ["SYD"], ["Y"], ["delta"], "2027-02-01", "2027-03-03")
-    assert res.calls == 2 and client.session.calls[1][0] == "https://seats.aero/partnerapi/search?cursor=5&skip=1&x=1"
+    assert res.calls == 2 and client.session.calls[1][0] == "https://seats.aero" + more, client.session.calls[1]
+    assert client.session.calls[1][1] == {}, "moreURL already carries the query"
 
     client.session = _FakeSession([
         _FakeResponse({"data": [raw[0]], "hasMore": True, "cursor": 1}) for _ in range(5)])
