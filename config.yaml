@@ -1,0 +1,135 @@
+# JFK <-> SYD award monitor, open-date mode, four cabin views.
+#
+# No fixed travel dates. The monitor scans the whole bookable calendar, ranks
+# every legal date combination by miles, and keeps one leaderboard per cabin.
+# Each cabin carries its own thresholds. A cabin with null floor and ceiling is
+# observe-only. It gets scanned, stored and ranked but never alerts.
+
+api:
+  base_url: "https://seats.aero/partnerapi"
+  key_env: "SEATS_AERO_API_KEY"
+  daily_call_budget: 1000
+  # Leave headroom so a manual --once never trips the cap.
+  budget_safety_margin: 100
+  timeout_seconds: 30
+  # A window that needs more pages than this is truncated and logged.
+  max_pages_per_query: 20
+  page_size: 500
+
+horizon:
+  # Delta loads schedule roughly 331 days out. Start far enough forward that
+  # award inventory exists. Adjust min_days_out down for a last-minute deal.
+  min_days_out: 45
+  max_days_out: 331
+  # Each API call covers this many days. Smaller chunks mean more calls but
+  # less pagination per call. --budget shows the measured pagination.
+  chunk_days: 31
+
+scan:
+  # Full calendar sweep, both directions, every N hours.
+  sweep_interval_hours: 6
+  # Focused re-poll of the months around each cabin's best combination.
+  focus_interval_minutes: 15
+  # Focus windows go to the top date of each cabin first (Y, W, J, F), then
+  # fill by global rank. Four cabins and three windows means the fourth cabin
+  # only gets a focus window when another cabin has nothing.
+  max_focus_windows: 3
+
+trip:
+  party_size: 4
+  outbound_origins: ["JFK", "EWR", "LGA", "BOS", "IAD", "PHL"]
+  outbound_destinations: ["SYD", "MEL", "BNE"]
+
+  # Mirrored automatically for the return direction.
+  min_trip_nights: 10
+  max_trip_nights: 35
+  require_same_source: true
+  allow_open_jaw: false
+  # An outbound in business and a return in economy is not a business
+  # redemption. Leave false so every pairing is one cabin both ways. When true,
+  # a mixed pairing ranks under its lower cabin and --best adds a cabins column.
+  allow_mixed_cabin: false
+
+# One block per cabin. Every key is optional except sources.
+#   label                   name used in headers and alert titles
+#   enabled                 false skips the cabin entirely
+#   sources                 programs worth querying for this cabin
+#   benchmark_miles         what you have actually paid, or null for a blank column
+#   floor_miles             at or under this always alerts
+#   ceiling_miles           above this never alerts
+#   new_best_margin_miles   also alert on a new cabin best that beats the old by this
+#   max_total_taxes_usd     round trip tax cap per person, null for none
+#   min_seats               defaults to trip.party_size, only lower it deliberately
+#   pushover_priority       -2 silent, -1 quiet, 0 normal, 1 bypasses quiet hours, 2 repeats until acknowledged
+# floor and ceiling are set together or left null together. Null means
+# observe-only. --calibrate proposes numbers once there is enough history.
+cabins:
+  Y:
+    label: "Economy"
+    enabled: true
+    sources: [delta, virginatlantic, virginaustralia, qantas, alaska, american, united, aeroplan]
+    benchmark_miles: 66200        # verified, April 2026 receipt
+    floor_miles: 60000
+    ceiling_miles: 72000
+    new_best_margin_miles: 3000
+    max_total_taxes_usd: 400
+    pushover_priority: 1
+  W:
+    label: "Premium Economy"
+    enabled: true
+    sources: [delta, virginatlantic, virginaustralia, qantas, alaska, american, united, aeroplan]
+    benchmark_miles: null         # no prior redemption
+    floor_miles: null             # observe-only until --calibrate has history
+    ceiling_miles: null
+    new_best_margin_miles: 8000
+    max_total_taxes_usd: 500
+    pushover_priority: 0
+  J:
+    label: "Business"
+    enabled: true
+    sources: [delta, virginatlantic, virginaustralia, qantas, alaska, american, united, aeroplan]
+    benchmark_miles: null
+    floor_miles: null
+    ceiling_miles: null
+    new_best_margin_miles: 20000
+    max_total_taxes_usd: 800
+    min_seats: 4
+    pushover_priority: 0
+  F:
+    label: "First"
+    enabled: true
+    # Delta sells no first class on this route. First here means partner metal,
+    # mostly Qantas, so the useful sources are narrower.
+    sources: [qantas, alaska, american]
+    benchmark_miles: null
+    floor_miles: null
+    ceiling_miles: null
+    new_best_margin_miles: 40000
+    max_total_taxes_usd: 1200
+    min_seats: 2                  # four first class seats together is a fantasy
+    pushover_priority: 0
+
+# Global alert plumbing. Price thresholds live under cabins.
+alerting:
+  # Legs older than this are dropped before ranking for alerts. --best uses a
+  # window 24 times wider so the leaderboard survives a quiet day.
+  max_data_age_hours: 12
+  # Some programs never publish seat counts and return zero. False alerts
+  # anyway and labels the row "?". Flip to true once you know which of the
+  # eight sources report honestly.
+  require_seat_count: false
+  # The same pairing alerts again only if it improves by this much or the
+  # cooldown expires.
+  improvement_threshold_miles: 3000
+  cooldown_hours: 6
+
+pushover:
+  user_key_env: "PUSHOVER_USER_KEY"
+  app_token_env: "PUSHOVER_APP_TOKEN"
+  api_url: "https://api.pushover.net/1/messages.json"
+  # Priority is per cabin, see pushover_priority above.
+  sound: "persistent"
+
+storage:
+  db_path: "award_monitor.sqlite3"
+  retain_observation_days: 400
