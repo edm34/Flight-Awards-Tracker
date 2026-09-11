@@ -211,6 +211,12 @@ business alert. The same pairing repeats only if it improves by
 from both legs' fingerprints, which carry the cabin, so the same dates in a
 different cabin are a different alert.
 
+Each cabin sends at most one message per pass. The cheapest qualifying
+pairing is written out in full and every other qualifying pairing gets one
+line, so twenty return dates at one price arrive as one message titled
+`60k ECONOMY AMERICAN JFK-SYD +19 more` rather than twenty messages. Each
+pairing inside the digest is still deduped on its own.
+
 Alert titles carry the cabin, for example `285k BUSINESS DELTA JFK-SYD`.
 Pushover priority comes from the cabin, so an economy floor hit can wake you at
 3am while a business observation waits until morning. Every alert carries the
@@ -238,8 +244,10 @@ is seats.aero's crawl rather than your poll interval. Rows older than
 24 times wider so it survives a quiet day.
 
 **Seat counts.** Some programs never publish them and return zero. The default
-alerts anyway and labels the row `?`. Flip `require_seat_count` to true once you
-know which of your eight sources report honestly.
+alerts anyway and labels the row `?`. The first live sweep showed Alaska and
+Qantas publishing a count on every row and American publishing none. Flip
+`require_seat_count` to true to drop unverifiable rows from the leaderboard and
+the alerts.
 
 **Four seats stays the constraint.** A cheap print usually surfaces with one or
 two. The leaderboard shows the binding seat count per row so you can see whether

@@ -72,6 +72,10 @@ CALIBRATE_MIN_DAYS = 14
 # How deep into each cabin's ranked list evaluate() looks for alerts.
 ALERT_SCAN_DEPTH = 20
 
+# Qualifying pairings beyond the cheapest are listed in the same message, one
+# line each, up to this many. Pushover caps a message at 1024 characters.
+DIGEST_ROWS = 6
+
 FARE_BRAND_REMINDER = "Check fare brand before you commit. Main Basic is non-refundable after 24h."
 
 
@@ -848,6 +852,30 @@ def format_alert(rt: RoundTrip, seat_note: str, reason: str,
     return title, "\n".join(lines)
 
 
+def format_digest(hits: list[tuple[RoundTrip, str, str]], party: int,
+                  cabin_cfg: dict) -> tuple[str, str]:
+    """One message per cabin per pass. The cheapest qualifying pairing in
+    full, then the other qualifying dates one line each. Twenty return dates
+    at one price are one message, not twenty. The first live sweep sent
+    twenty and that is why this exists."""
+    rt, note, reason = hits[0]
+    title, body = format_alert(rt, note, reason, party, cabin_cfg)
+    if len(hits) == 1:
+        return title, body
+    title += f" +{len(hits) - 1} more"
+    lines = body.split("\n")
+    extra = ["Also qualifying, per person"]
+    for other, _, _ in hits[1:DIGEST_ROWS + 1]:
+        seats = f"  {other.min_seats} seats" if other.min_seats else ""
+        extra.append(f"{other.outbound.depart_date} > {other.inbound.depart_date}  "
+                     f"{other.outbound.source} {other.route}  {other.total_miles:,}{seats}")
+    rest = len(hits) - 1 - DIGEST_ROWS
+    if rest > 0:
+        extra.append(f"and {rest} more, run --best --cabin {cabin_cfg['code']}")
+    # body ends with a blank line and the fare brand reminder. Keep them last.
+    return title, "\n".join(lines[:-2] + extra + lines[-2:])
+
+
 def send_pushover(cfg: dict, title: str, message: str, priority: int = 0) -> bool:
     user = os.environ.get(cfg["user_key_env"], "").strip()
     token = os.environ.get(cfg["app_token_env"], "").strip()
@@ -919,18 +947,27 @@ def evaluate(cfg: dict, store: Store, dry_run: bool) -> dict[str, list[RoundTrip
         # alerts on the whole leaderboard instead of just the winner. The best
         # is per cabin so a cheap economy pairing never suppresses business.
         running_best = prev_best
+        hits: list[tuple[RoundTrip, str, str]] = []
         for rt, note in rows[:ALERT_SCAN_DEPTH]:
             reason = alert_reason(rt, running_best, ccfg)
             if not reason or not should_alert(rt, store, alert_cfg):
                 continue
-            title, message = format_alert(rt, note, reason, party, ccfg)
+            hits.append((rt, note, reason))
+            running_best = min(running_best or rt.total_miles, rt.total_miles)
+
+        # Everything that qualified goes out as one message for this cabin.
+        if hits:
+            title, message = format_digest(hits, party, ccfg)
             if dry_run:
                 print(f"\n--- WOULD ALERT (priority {ccfg['pushover_priority']}) ---\n{title}\n{message}")
-                store.save_alert(rt)
-            elif send_pushover(cfg["pushover"], title, message, ccfg["pushover_priority"]):
-                store.save_alert(rt)
-                LOG.info("Alerted: %s (%s)", title, reason)
-            running_best = min(running_best or rt.total_miles, rt.total_miles)
+                sent = True
+            else:
+                sent = send_pushover(cfg["pushover"], title, message, ccfg["pushover_priority"])
+                if sent:
+                    LOG.info("Alerted: %s, %d pairing(s)", title, len(hits))
+            if sent:
+                for rt, _, _ in hits:
+                    store.save_alert(rt)
 
         if prev_best is None or best_rt.total_miles < prev_best:
             store.set_state(state_key, best_rt.total_miles)
@@ -1662,6 +1699,30 @@ def self_test() -> None:
         evaluate(cfg, store, dry_run=True)
     assert "WOULD ALERT" not in buf.getvalue(), "alerts repeated on the second pass"
     print("dedupe ok: second pass is silent")
+
+    # -- a burst of qualifying pairings is one message ------------------------
+    burst = Store(":memory:")
+    burst_raw = [av("b0", "delta", "JFK", "SYD", "2027-03-01", Y=(27000, 6, 6600))]
+    for i in range(12):
+        day = (date(2027, 3, 13) + timedelta(days=i)).isoformat()
+        burst_raw.append(av(f"b{i + 1}", "delta", "SYD", "JFK", day, Y=(27000, 4, 6600)))
+    burst.record_legs([leg for obj in burst_raw for leg in parse_availability(obj, CABIN_ORDER)])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        evaluate(cfg, burst, dry_run=True)
+    out = buf.getvalue()
+    assert out.count("WOULD ALERT") == 1, out
+    assert "54k ECONOMY DELTA JFK-SYD +11 more" in out, out
+    assert out.count("2027-03-01 > ") == DIGEST_ROWS and "and 5 more, run --best --cabin Y" in out, out
+    assert out.strip().endswith(FARE_BRAND_REMINDER), "reminder must stay last"
+    digest_body = out.split("+11 more\n", 1)[1]
+    assert len(digest_body) <= 1024, f"Pushover cap, {len(digest_body)} chars"
+    assert burst.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 12
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        evaluate(cfg, burst, dry_run=True)
+    assert "WOULD ALERT" not in buf.getvalue(), "digest members must be deduped individually"
+    print("digest ok: 12 under-floor pairings are one message, all 12 deduped after")
 
     # -- leaderboard rendering ----------------------------------------------
     buf = io.StringIO()

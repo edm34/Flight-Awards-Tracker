@@ -39,6 +39,10 @@ calibration, self test, main.
   `best_total_miles:<cabin>`. Keep it single pass. An earlier version compared
   every candidate against a stale figure and alerted on the entire leaderboard
   on cold start. Observe-only cabins still track a best.
+- `evaluate` collects every qualifying pairing for a cabin and sends one
+  message through `format_digest`. The first live sweep sent twenty separate
+  messages for twenty return dates at one price. Don't go back to one
+  message per pairing.
 - `choose_focus_dates` takes the top date from each cabin first, then fills by
   global rank, capped at `scan.max_focus_windows`.
 - `cached_search` returns a `SearchResult` with the calls it used. `run_sweep`
@@ -78,9 +82,12 @@ The quota header is `x-ratelimit-remaining` against `x-ratelimit-limit`
 1000. The cabin filter is the `cabins` parameter with word values. There is
 no `ComputedLastSeen`.
 
-Still open after one probe page. Which programs return anything in J and F
-for these routes. The first page of Oct to Nov 2026 had Y 25, W 3, J 0, F 0.
-Empty is a finding, not a bug. The first full sweep will say.
+From the first full sweep on 11 Sep 2026, 3,381 legs over the whole horizon.
+Only Qantas, Alaska and American returned rows. Delta, Virgin Atlantic,
+Virgin Australia, United and Aeroplan returned nothing at all, which is
+worth checking by hand on seats.aero before trusting, since the benchmark
+is a Delta redemption. First class returned nothing anywhere. Alaska and
+Qantas publish seat counts on every row, American on none.
 
 ## Constraints that matter
 
