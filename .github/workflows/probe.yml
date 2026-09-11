@@ -1,0 +1,40 @@
+name: probe
+
+# One live call to seats.aero to check the parser against the real API
+# (BUILD.md Task 0). Manual only: Actions tab > probe > Run workflow.
+# Read the field table in the "Probe" step log.
+#
+# It doesn't touch monitor state and isn't in the award-monitor concurrency
+# group, so running it can't cancel a queued sweep or poll.
+#
+# Note: a manual workflow only shows up in the Actions tab once this file is on
+# the default branch. After that, the "Use workflow from" dropdown lets you run
+# it against a feature branch to test parser fixes before merging.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Probe
+        env:
+          SEATS_AERO_API_KEY: ${{ secrets.SEATS_AERO_API_KEY }}
+        run: python monitor.py --probe
+
+      - name: Self-test
+        if: ${{ !cancelled() }}
+        run: python monitor.py --self-test
