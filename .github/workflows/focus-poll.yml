@@ -66,28 +66,12 @@ jobs:
           SEATS_AERO_API_KEY: ${{ secrets.SEATS_AERO_API_KEY }}
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
-        run: python monitor.py --once --verbose
+        run: |
+          echo "down alert test, failing the poll on purpose"
+          exit 1
 
       - name: Publish leaderboard to the job summary
         run: python monitor.py --best >> "$GITHUB_STEP_SUMMARY" || true
-
-      # Saves even when the poll step failed partway, so alerts that already
-      # went out are recorded and not re-sent next run. Skipped only if the
-      # restore failed, because then there is nothing trustworthy to save.
-      - name: Save monitor state
-        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
-        run: |
-          if [ ! -f award_monitor.sqlite3 ]; then
-            echo "::warning::no award_monitor.sqlite3 to save"
-            exit 0
-          fi
-          git config user.name "award-monitor"
-          git config user.email "award-monitor@users.noreply.github.com"
-          git checkout --orphan tmp-state
-          git rm -rf --cached . >/dev/null 2>&1 || true
-          git add -f award_monitor.sqlite3
-          git commit -m "state $(date -u +%FT%TZ)" >/dev/null
-          git push -f origin tmp-state:monitor-state
 
   # A separate job so it still runs when the poll job times out. A timed-out
   # job counts as cancelled, and an in-job `if: failure()` step is skipped.
