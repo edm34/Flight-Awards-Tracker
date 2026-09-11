@@ -33,6 +33,7 @@ Add --dry-run to print alerts instead of sending them.
 from __future__ import annotations
 
 import argparse
+import bisect
 import copy
 import hashlib
 import io
@@ -811,32 +812,46 @@ def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
 def build_round_trips(legs: list[Leg], origins: list[str], destinations: list[str],
                       min_nights: int, max_nights: int, pairing: dict,
                       trip_key: str = "") -> list[RoundTrip]:
-    """Pair every outbound leg with every legal return leg for one trip."""
+    """Pair every outbound leg with every legal return leg for one trip.
+
+    Returns are bucketed by everything a pairing must match on (arrival
+    airport unless open jaw, program unless sources may differ, cabin unless
+    mixed cabins are allowed) and sorted by date, so each outbound only walks
+    the returns inside its night window. Four trips of a year each are tens
+    of thousands of legs, and the naive cross product took minutes."""
     out_origins, out_dests = set(origins), set(destinations)
     outbound = [l for l in legs if l.origin in out_origins and l.destination in out_dests]
     inbound = [l for l in legs if l.origin in out_dests and l.destination in out_origins]
-
-    # Bucket returns by origin airport so the inner loop stays small.
-    by_origin: dict[str, list[Leg]] = {}
-    for leg in inbound:
-        by_origin.setdefault(leg.origin, []).append(leg)
 
     same_source = pairing["require_same_source"]
     open_jaw = pairing["allow_open_jaw"]
     mixed_ok = pairing["allow_mixed_cabin"]
 
+    def bucket_key(leg: Leg, airport: str) -> tuple:
+        return (airport if not open_jaw else "",
+                leg.source if same_source else "",
+                leg.cabin if not mixed_ok else "")
+
+    buckets: dict[tuple, list[Leg]] = {}
+    for leg in inbound:
+        buckets.setdefault(bucket_key(leg, leg.origin), []).append(leg)
+    dates: dict[tuple, list[str]] = {}
+    for key, group in buckets.items():
+        group.sort(key=lambda l: l.depart_date)
+        dates[key] = [l.depart_date for l in group]
+
     pairs: list[RoundTrip] = []
     for out in outbound:
-        candidates = inbound if open_jaw else by_origin.get(out.destination, [])
-        for back in candidates:
-            if same_source and out.source != back.source:
-                continue
-            if not mixed_ok and out.cabin != back.cabin:
-                continue
-            rt = RoundTrip(out, back, trip_key)
-            if not (min_nights <= rt.nights <= max_nights):
-                continue
-            pairs.append(rt)
+        key = bucket_key(out, out.destination)
+        group = buckets.get(key)
+        if not group:
+            continue
+        day = datetime.strptime(out.depart_date, "%Y-%m-%d").date()
+        lo = (day + timedelta(days=min_nights)).isoformat()
+        hi = (day + timedelta(days=max_nights)).isoformat()
+        ds = dates[key]
+        for back in group[bisect.bisect_left(ds, lo):bisect.bisect_right(ds, hi)]:
+            pairs.append(RoundTrip(out, back, trip_key))
     return pairs
 
 
@@ -2096,6 +2111,10 @@ def self_test() -> None:
     mixed_pairing = dict(cfg["pairing"], allow_mixed_cabin=True)
     mixed = [p for p in build_round_trips(fresh, cfg["origins"], au["destinations"], 10, 35, mixed_pairing) if p.mixed]
     assert mixed and all(p.cabin == "Y" for p in mixed if "Y" in p.cabin_code), "mixed ranks under lower cabin"
+    brute = [RoundTrip(o, b) for o in fresh if o.origin in ("JFK", "EWR") and o.destination in ("SYD", "MEL")
+             for b in fresh if b.origin == o.destination and b.destination in ("JFK", "EWR")
+             and b.source == o.source and b.cabin == o.cabin and 10 <= RoundTrip(o, b).nights <= 35]
+    assert sorted(p.key() for p in au_pairs) == sorted(p.key() for p in brute), "bucketed pairing must equal brute force"
     print(f"pairing ok: {len(au_pairs)} same-cabin combos for Australia, {len(mixed)} mixed rejected by default")
 
     # -- ranking and seat status --------------------------------------------
