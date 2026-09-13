@@ -138,9 +138,12 @@ seats.aero's crawl, not the poll interval. Do not add a live search call path.
   don't go back to a row per sighting without `storage.record_unchanged`,
   four trips are eighty thousand legs a sweep on a database that lives on a
   git branch.
-- The database is force-pushed to `monitor-state` every run. At four trips
-  it is tens of megabytes. `prune` runs `VACUUM` so the file shrinks. If the
-  repo's size becomes a problem, move state to a release asset.
+- The database is force-pushed to `monitor-state` every run and GitHub
+  refuses a file over 100 MiB. It hit that on 13 Sep 2026 after two days of
+  a row per sighting. `prune` drops flown departure dates and change ticks
+  older than `retain_observation_days` while always keeping each leg's
+  latest tick, then runs `VACUUM`. `prune_history` warns past 70 MB. If it
+  ever grows past that, move state to a release asset.
 - Thresholds are never written to `config.yaml` by code. `--calibrate` prints
   a block to paste.
 

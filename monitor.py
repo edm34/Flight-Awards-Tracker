@@ -84,6 +84,10 @@ ALERT_SCAN_DEPTH = 20
 # line each, up to this many. Pushover caps a message at 1024 characters.
 DIGEST_ROWS = 6
 
+# The state database is force-pushed to a git branch. GitHub refuses a file
+# over 100 MiB, and the save step failed on exactly that once. Warn early.
+DB_SIZE_WARN_MB = 70
+
 # Rows per trip and cabin written to the dashboard file.
 DASHBOARD_ROWS = 15
 DASHBOARD_HISTORY_DAYS = 45
@@ -461,6 +465,40 @@ class Store:
         if "last_confirmed_at" not in cols:
             self.conn.execute("ALTER TABLE observations ADD COLUMN last_confirmed_at TEXT")
             self.conn.execute("UPDATE observations SET last_confirmed_at = observed_at")
+            self.conn.commit()
+            dropped = self.collapse_repeated_ticks()
+            if dropped:
+                LOG.info("Collapsed %d repeated ticks into their first sighting", dropped)
+
+    def collapse_repeated_ticks(self) -> int:
+        """One-time repair for a database written a row per sighting. Runs of
+        consecutive identical ticks for one leg collapse into the first, and
+        that row's last_confirmed_at becomes the last repeat's observed_at.
+        Nothing that changed is touched. The state branch had grown past
+        GitHub's file limit on four days of this."""
+        rows = self.conn.execute(
+            """SELECT id, fingerprint, miles, taxes_usd, seats, airlines, direct, observed_at
+               FROM observations ORDER BY fingerprint, id""").fetchall()
+        delete: list[tuple[int]] = []
+        touch: dict[int, str] = {}
+        kept: sqlite3.Row | None = None
+        for r in rows:
+            same = (kept is not None and kept["fingerprint"] == r["fingerprint"]
+                    and (kept["miles"], kept["taxes_usd"], kept["seats"], kept["airlines"] or "",
+                         kept["direct"]) == (r["miles"], r["taxes_usd"], r["seats"],
+                                             r["airlines"] or "", r["direct"]))
+            if same:
+                delete.append((r["id"],))
+                touch[kept["id"]] = r["observed_at"]
+            else:
+                kept = r
+        if delete:
+            self.conn.executemany("DELETE FROM observations WHERE id = ?", delete)
+            self.conn.executemany("UPDATE observations SET last_confirmed_at = ? WHERE id = ?",
+                                  [(at, rid) for rid, at in touch.items()])
+            self.conn.commit()
+            self.conn.execute("VACUUM")
+        return len(delete)
 
     # -- state ------------------------------------------------------------
     def get_state(self, key: str, default: Any = None) -> Any:
@@ -626,15 +664,27 @@ class Store:
         )
         self.conn.commit()
 
-    def prune(self, days: int) -> int:
+    def prune(self, days: int, snapshot_days: int = 400, today: date | None = None) -> int:
+        """Keep the database bounded. Legs whose departure date has passed go.
+        Change ticks older than the retention go, except each leg's latest
+        tick, which ranking and calibration read and which keeps its first
+        sighting date. Snapshots, the dashboard's history, keep longer, they
+        are tiny. VACUUM so the file on the state branch actually shrinks."""
+        today = today or datetime.now(timezone.utc).date()
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        cur = self.conn.execute(
-            "DELETE FROM observations WHERE COALESCE(last_confirmed_at, observed_at) < ?", (cutoff,))
-        self.conn.execute("DELETE FROM snapshots WHERE at < ?", (cutoff,))
+        flown = self.conn.execute(
+            "DELETE FROM observations WHERE depart_date < ?", (today.isoformat(),)).rowcount
+        stale = self.conn.execute(
+            """DELETE FROM observations
+               WHERE COALESCE(last_confirmed_at, observed_at) < ?
+                 AND id NOT IN (SELECT MAX(id) FROM observations GROUP BY fingerprint)""",
+            (cutoff,)).rowcount
+        snap_cutoff = (datetime.now(timezone.utc) - timedelta(days=snapshot_days)).isoformat()
+        self.conn.execute("DELETE FROM snapshots WHERE at < ?", (snap_cutoff,))
         self.conn.commit()
-        if cur.rowcount:
+        if flown or stale:
             self.conn.execute("VACUUM")
-        return cur.rowcount
+        return flown + stale
 
 
 # ---------------------------------------------------------------------------
@@ -1176,10 +1226,18 @@ def prune_history(cfg: dict, store: Store) -> int:
     """Drop observations past the retention window. Runs at the end of every
     sweep and focus poll so scheduled mode, which never enters the loop,
     still keeps the database bounded."""
-    dropped = store.prune(cfg["storage"]["retain_observation_days"])
+    dropped = store.prune(cfg["storage"]["retain_observation_days"],
+                          cfg["storage"].get("retain_snapshot_days", 400))
     if dropped:
-        LOG.info("Pruned %d observations older than %d days", dropped,
-                 cfg["storage"]["retain_observation_days"])
+        LOG.info("Pruned %d observations, flown dates and change ticks older than %d days",
+                 dropped, cfg["storage"]["retain_observation_days"])
+    path = cfg["storage"]["db_path"]
+    if path != ":memory:" and os.path.exists(path):
+        size_mb = os.path.getsize(path) / 1e6
+        if size_mb > DB_SIZE_WARN_MB:
+            LOG.warning("Database is %.0f MB. GitHub refuses files over 100 MiB and the state "
+                        "branch would stop saving. Lower retain_observation_days or move state "
+                        "off git.", size_mb)
     return dropped
 
 
@@ -2358,6 +2416,28 @@ def self_test() -> None:
     assert tick.record_legs([fewer], record_unchanged=True) == (1, 0), "record_unchanged restores a tick per sighting"
     assert tick.record_legs([]) == (0, 0)
     print("ticks ok: new or changed legs are rows, unchanged legs only refresh last_confirmed_at")
+    # a database written a row per sighting collapses to one row per change
+    legacy = Store(":memory:")
+    t = [(now_dt - timedelta(hours=h)).isoformat() for h in (30, 20, 10, 5, 1)]
+    for at, miles in zip(t, (30000, 30000, 30000, 27000, 27000)):
+        legacy.record_legs([Leg(**dict(asdict(base), miles=miles, observed_at=at, last_seen=at))], record_unchanged=True)
+    legacy.record_legs([Leg(**dict(asdict(base), origin="EWR", observed_at=t[0], last_seen=t[0]))], record_unchanged=True)
+    assert legacy.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 6
+    assert legacy.collapse_repeated_ticks() == 3
+    left = legacy.conn.execute("SELECT origin, miles, observed_at, last_confirmed_at FROM observations ORDER BY id").fetchall()
+    assert [tuple(r) for r in left] == [("JFK", 30000, t[0], t[2]), ("JFK", 27000, t[3], t[4]), ("EWR", 30000, t[0], t[0])], [tuple(r) for r in left]
+    assert legacy.collapse_repeated_ticks() == 0
+    print("collapse ok: a row per sighting database shrinks to a row per change with the right stamps")
+    keep = Store(":memory:")
+    ago = lambda d: (now_dt - timedelta(days=d)).isoformat()
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 30000, 66.0, 4, "DL", False, ago(40), ago(40))])
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 29000, 66.0, 4, "DL", False, ago(30), ago(30))])
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 28000, 66.0, 4, "DL", False, ago(20), ago(20))])
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2026-01-01", "Y", 28000, 66.0, 4, "DL", False, now, now)])
+    assert keep.prune(14, today=date(2026, 9, 13)) == 3
+    left = keep.conn.execute("SELECT depart_date, miles FROM observations").fetchall()
+    assert [tuple(r) for r in left] == [("2027-06-01", 28000)], left
+    print("prune ok: flown dates and old change ticks go, each leg's latest tick stays whatever its age")
 
     # -- prune runs at the end of --sweep and --once --------------------------
     for label, runner in (("sweep", run_sweep), ("once", run_focus)):
@@ -2366,15 +2446,18 @@ def self_test() -> None:
         pst.record_legs([
             Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, stale, stale),
             Leg("s", "delta", "JFK", "SYD", "2027-03-02", "Y", 30000, 66.0, 4, "DL", False, now, now),
-        ])
+        ], record_unchanged=True)
+        pst.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 28000, 66.0, 4, "DL", False, stale, stale)],
+                        record_unchanged=True)
         pst.set_state("focus_windows", [{"trip": "australia", "date": "2027-03-14"},
                                         {"trip": "gone", "date": "2027-03-14"}])
         pcl = SeatsAero(cfg, pst, api_key="test-key")
         pcl.session = _FakeSession([_FakeResponse({"data": [], "hasMore": False})], repeat_last=True)
         with redirect_stdout(io.StringIO()):
             runner(cfg, pst, pcl, True)
-        left = pst.conn.execute("SELECT observed_at FROM observations").fetchall()
-        assert [r[0] for r in left] == [now], f"{label} kept {left}"
+        left = pst.conn.execute("SELECT depart_date, miles, observed_at FROM observations ORDER BY id").fetchall()
+        assert [tuple(r) for r in left] == [("2027-03-02", 30000, now), ("2027-03-01", 28000, stale)], \
+            f"{label} kept {[tuple(r) for r in left]}, the old 30000 tick goes, the latest 28000 tick stays"
         assert pst.calls_today() == (40 if label == "sweep" else 2), (label, pst.calls_today())
     print("prune ok: --sweep covers every trip, --once skips windows for unknown trips, both prune")
 

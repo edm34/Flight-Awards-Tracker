@@ -251,7 +251,8 @@ history stays complete without eighty thousand duplicate rows a sweep. Each run 
 run refuses to start on a blank database if that branch exists but can't be
 read. Both scheduled workflows share one concurrency group, and a separate job
 sends a Pushover message if a run fails or times out. Every run prunes
-observations past `storage.retain_observation_days` on its way out, and
+flown departure dates and change ticks past `storage.retain_observation_days`
+on its way out, keeping each leg's latest tick, and
 `--best` fences its output in a code block under Actions so the job summary
 keeps its columns.
 
