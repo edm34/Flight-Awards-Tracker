@@ -1,17 +1,16 @@
 name: full-sweep
 
-# Full calendar sweep across the whole bookable horizon.
-# Four times a day. This is the expensive one in API calls, not minutes.
-# It resets the focus windows that focus-poll.yml then tracks.
+# Full calendar sweep across the whole bookable horizon, every trip.
+# Three times a day. This is the expensive one in API calls, not minutes.
+# It resets the focus windows that focus-poll.yml then tracks. Mirror any
+# change here in scan.sweeps_per_day in config.yaml.
 #
-# Runs at :17 so it never lands in the same minute as a focus poll (:07, :37).
-# A 30-minute sweep starting at :17 holds the lock through the :37 poll, which
-# waits in the queue and runs after.
+# Runs at :17 so it never lands in the same minute as a focus poll (:07).
 #
 # Scheduled triggers only fire from the DEFAULT branch.
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 */8 * * *"
   workflow_dispatch:
 
 # Shared with focus-poll.yml. See the note there.

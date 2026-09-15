@@ -8,7 +8,7 @@ can watch the market yourself. Runs on GitHub Actions, no server.
 
 ## The benchmark
 
-From the April 2026 award receipt, confirmation GYLTUY, ticketed 6 Nov 2025:
+From the April 2026 award receipt, ticketed 6 Nov 2025:
 
 | | |
 |---|---|
@@ -20,7 +20,7 @@ From the April 2026 award receipt, confirmation GYLTUY, ticketed 6 Nov 2025:
 | Booked | 139 days before departure |
 | Fare | Delta Main Basic (N), fare basis ESVR331/FFX15 |
 
-You booked roughly four and a half months out, so the horizon runs 45 to 331
+You booked roughly four and a half months out, so the horizon runs 45 to 360
 days forward. You flew Basic Economy, which is non-changeable and almost always
 non-refundable once the 24 hour window closes. Every alert carries a reminder
 to check the fare brand before confirming.
@@ -113,6 +113,23 @@ three weeks of history, the gap against the recent typical best. A closing line
 names the cheapest trip per cabin. This is the "should we go somewhere else
 instead" view. The same table heads `--best` and the dashboard.
 
+## The calendar
+
+```bash
+python monitor.py --calendar --trip australia --cabin Y            # by departure day
+python monitor.py --calendar --trip australia --cabin J --returns  # by return day
+```
+
+Twelve months of days for one trip and cabin. Each cell is the cheapest
+viable round trip that departs (or returns) that day, in thousands of miles
+per person, with `?` when the seats are not confirmed, a dot where a one-way
+leg exists but nothing pairs into a bookable round trip, and blank outside
+the scanned horizon. The dashboard draws the same twelve months as a heat
+grid with a cabin picker and a departures/returns toggle, and hovering a day
+shows the price, the matching return date, the program and the seat status.
+The horizon runs 45 to 360 days out so the grid reaches a year ahead. Most
+programs load inventory 331 to 355 days ahead, so the last month is thin.
+
 ## Choosing dates by price
 
 ```bash
@@ -149,8 +166,9 @@ Every scheduled run writes `dashboard.json` to the `monitor-state` branch
 next to the database. The dashboard is a published claude.ai page that reads
 that file through your GitHub connector and refreshes itself every minute, so
 it is at most one poll behind the market. It shows the overview as cards, a
-tab per trip with the four cabin leaderboards, a sparkline of each cabin's
-best price over the last 45 days, and a seat pill on every row.
+tab per trip with a twelve month calendar, the four cabin leaderboards, a
+sparkline of each cabin's best price over the last 45 days, and a seat pill
+on every row.
 
 The page needs the GitHub connector in claude.ai Settings > Connectors. Without
 it the page still renders the snapshot it was published with and says how to
@@ -205,16 +223,17 @@ at 3am while a business observation waits until morning.
 Two modes share one budget.
 
 **Sweep** walks the full horizon in 31 day windows, every trip, both
-directions. Ten date ranges times four trips is 40 windows, two calls each,
-four times a day.
+directions. Eleven date ranges times four trips is 44 windows, three times a
+day. Europe returns about four thousand legs a window and needs seven calls
+where the other trips need two, so a sweep is about 143 calls.
 
-**Focus** re-polls the months around the best combinations. Every trip's
-economy top first, then every trip's premium top, and so on, capped at
-`max_focus_windows`, every 30 minutes on the schedule.
+**Focus** re-polls `focus_pad_days` either side of the best dates. Every
+trip's economy top first, then every trip's premium top, and so on, capped
+at `max_focus_windows`, hourly on the schedule.
 
 Every sweep records how many calls each window actually took and `--budget`
-multiplies the plan by that measured figure. Four trips plan at 704 of 900
-usable calls a day before pagination.
+multiplies the plan by that measured figure. Four trips plan at 741 of 900
+usable calls a day at the measured 3.25 calls per window.
 
 ## Hosting on GitHub Actions
 
@@ -222,15 +241,18 @@ usable calls a day before pagination.
 `.github/workflows` run the monitor without a server.
 
 - `probe.yml` is manual. One live call, prints the reconciliation table.
-- `focus-poll.yml` runs `--once` at :07 and :37 every hour.
-- `full-sweep.yml` runs `--sweep` at :17 every six hours.
+- `focus-poll.yml` runs `--once` hourly at :07.
+- `full-sweep.yml` runs `--sweep` at :17 every eight hours.
 
 The database and `dashboard.json` live on an orphan branch called
-`monitor-state`. Each run restores them, works, then force-pushes them back. A
+`monitor-state`. A leg gets a new row only when it is new or something about
+it changed, and an unchanged leg refreshes its `last_confirmed_at`, so the
+history stays complete without eighty thousand duplicate rows a sweep. Each run restores them, works, then force-pushes them back. A
 run refuses to start on a blank database if that branch exists but can't be
 read. Both scheduled workflows share one concurrency group, and a separate job
 sends a Pushover message if a run fails or times out. Every run prunes
-observations past `storage.retain_observation_days` on its way out, and
+flown departure dates and change ticks past `storage.retain_observation_days`
+on its way out, keeping each leg's latest tick, and
 `--best` fences its output in a code block under Actions so the job summary
 keeps its columns.
 

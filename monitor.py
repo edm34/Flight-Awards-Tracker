@@ -33,6 +33,7 @@ Add --dry-run to print alerts instead of sending them.
 from __future__ import annotations
 
 import argparse
+import bisect
 import copy
 import hashlib
 import io
@@ -82,6 +83,10 @@ ALERT_SCAN_DEPTH = 20
 # Qualifying pairings beyond the cheapest are listed in the same message, one
 # line each, up to this many. Pushover caps a message at 1024 characters.
 DIGEST_ROWS = 6
+
+# The state database is force-pushed to a git branch. GitHub refuses a file
+# over 100 MiB, and the save step failed on exactly that once. Warn early.
+DB_SIZE_WARN_MB = 70
 
 # Rows per trip and cabin written to the dashboard file.
 DASHBOARD_ROWS = 15
@@ -342,6 +347,7 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
     scan.setdefault("sweeps_per_day", 4)
     scan.setdefault("polls_per_day", 48)
     scan.setdefault("max_focus_windows", 4)
+    scan.setdefault("focus_pad_days", 10)
 
     api = cfg["api"]
     api.setdefault("budget_safety_margin", 0)
@@ -394,7 +400,8 @@ CREATE TABLE IF NOT EXISTS observations (
     airlines TEXT,
     direct INTEGER,
     last_seen TEXT,
-    observed_at TEXT NOT NULL
+    observed_at TEXT NOT NULL,
+    last_confirmed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_obs_fp ON observations(fingerprint, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_date ON observations(depart_date, miles);
@@ -455,6 +462,43 @@ class Store:
         if "taxes_currency" not in cols:
             self.conn.execute(
                 "ALTER TABLE observations ADD COLUMN taxes_currency TEXT NOT NULL DEFAULT 'USD'")
+        if "last_confirmed_at" not in cols:
+            self.conn.execute("ALTER TABLE observations ADD COLUMN last_confirmed_at TEXT")
+            self.conn.execute("UPDATE observations SET last_confirmed_at = observed_at")
+            self.conn.commit()
+            dropped = self.collapse_repeated_ticks()
+            if dropped:
+                LOG.info("Collapsed %d repeated ticks into their first sighting", dropped)
+
+    def collapse_repeated_ticks(self) -> int:
+        """One-time repair for a database written a row per sighting. Runs of
+        consecutive identical ticks for one leg collapse into the first, and
+        that row's last_confirmed_at becomes the last repeat's observed_at.
+        Nothing that changed is touched. The state branch had grown past
+        GitHub's file limit on four days of this."""
+        rows = self.conn.execute(
+            """SELECT id, fingerprint, miles, taxes_usd, seats, airlines, direct, observed_at
+               FROM observations ORDER BY fingerprint, id""").fetchall()
+        delete: list[tuple[int]] = []
+        touch: dict[int, str] = {}
+        kept: sqlite3.Row | None = None
+        for r in rows:
+            same = (kept is not None and kept["fingerprint"] == r["fingerprint"]
+                    and (kept["miles"], kept["taxes_usd"], kept["seats"], kept["airlines"] or "",
+                         kept["direct"]) == (r["miles"], r["taxes_usd"], r["seats"],
+                                             r["airlines"] or "", r["direct"]))
+            if same:
+                delete.append((r["id"],))
+                touch[kept["id"]] = r["observed_at"]
+            else:
+                kept = r
+        if delete:
+            self.conn.executemany("DELETE FROM observations WHERE id = ?", delete)
+            self.conn.executemany("UPDATE observations SET last_confirmed_at = ? WHERE id = ?",
+                                  [(at, rid) for rid, at in touch.items()])
+            self.conn.commit()
+            self.conn.execute("VACUUM")
+        return len(delete)
 
     # -- state ------------------------------------------------------------
     def get_state(self, key: str, default: Any = None) -> Any:
@@ -469,36 +513,66 @@ class Store:
         self.conn.commit()
 
     # -- observations -----------------------------------------------------
-    def record_legs(self, legs: Iterable[Leg]) -> int:
-        rows = [
-            (
-                leg.fingerprint(), leg.availability_id, leg.source, leg.origin,
-                leg.destination, leg.depart_date, leg.cabin, leg.miles,
-                leg.taxes_usd, leg.taxes_currency, leg.seats, leg.airlines,
-                int(leg.direct), leg.last_seen, leg.observed_at,
+    def record_legs(self, legs: Iterable[Leg], record_unchanged: bool = False) -> tuple[int, int]:
+        """Store what a scan saw. A leg that is new, or whose price, taxes,
+        seats, airlines or routing changed since its latest tick, gets a new
+        tick. A leg that is exactly as last seen only has last_confirmed_at
+        touched on its latest tick. The price history stays complete, every
+        change is a row, without a copy of every unchanged row every half
+        hour. Four trips of a year are eighty thousand legs a sweep and the
+        database lives on a git branch. record_unchanged restores a tick per
+        sighting. Returns (ticks written, ticks touched)."""
+        legs = list(legs)
+        if not legs:
+            return 0, 0
+        wanted = {leg.fingerprint(): leg for leg in legs}
+        latest: dict[str, sqlite3.Row] = {}
+        if not record_unchanged:
+            for r in self.conn.execute(
+                    """SELECT o.id, o.fingerprint, o.miles, o.taxes_usd, o.seats, o.airlines, o.direct
+                       FROM observations o
+                       JOIN (SELECT fingerprint, MAX(id) AS mid FROM observations GROUP BY fingerprint) l
+                         ON o.id = l.mid"""):
+                if r["fingerprint"] in wanted:
+                    latest[r["fingerprint"]] = r
+        inserts, touches = [], []
+        for fp, leg in wanted.items():
+            cur = latest.get(fp)
+            if cur is not None and (cur["miles"], cur["taxes_usd"], cur["seats"], cur["airlines"] or "",
+                                    bool(cur["direct"])) == (leg.miles, leg.taxes_usd, leg.seats,
+                                                             leg.airlines, leg.direct):
+                touches.append((leg.observed_at, leg.last_seen, cur["id"]))
+                continue
+            inserts.append((
+                fp, leg.availability_id, leg.source, leg.origin, leg.destination,
+                leg.depart_date, leg.cabin, leg.miles, leg.taxes_usd, leg.taxes_currency,
+                leg.seats, leg.airlines, int(leg.direct), leg.last_seen, leg.observed_at,
+                leg.observed_at,
+            ))
+        if inserts:
+            self.conn.executemany(
+                """INSERT INTO observations
+                   (fingerprint, availability_id, source, origin, destination,
+                    depart_date, cabin, miles, taxes_usd, taxes_currency, seats,
+                    airlines, direct, last_seen, observed_at, last_confirmed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                inserts,
             )
-            for leg in legs
-        ]
-        self.conn.executemany(
-            """INSERT INTO observations
-               (fingerprint, availability_id, source, origin, destination,
-                depart_date, cabin, miles, taxes_usd, taxes_currency, seats,
-                airlines, direct, last_seen, observed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            rows,
-        )
+        if touches:
+            self.conn.executemany(
+                "UPDATE observations SET last_confirmed_at = ?, last_seen = ? WHERE id = ?", touches)
         self.conn.commit()
-        return len(rows)
+        return len(inserts), len(touches)
 
     def latest_legs(self, max_age_hours: float) -> list[Leg]:
         """Most recent observation per fingerprint, within the freshness window."""
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
         rows = self.conn.execute(
             """SELECT o.* FROM observations o
-               JOIN (SELECT fingerprint, MAX(id) AS mid
-                     FROM observations WHERE observed_at >= ?
+               JOIN (SELECT fingerprint, MAX(id) AS mid FROM observations
                      GROUP BY fingerprint) latest
-                 ON o.id = latest.mid""",
+                 ON o.id = latest.mid
+               WHERE COALESCE(o.last_confirmed_at, o.observed_at) >= ?""",
             (cutoff,),
         ).fetchall()
         return [_row_to_leg(r) for r in rows]
@@ -514,9 +588,10 @@ class Store:
         return [_row_to_leg(r) for r in rows]
 
     def history_span(self) -> dict[str, tuple[str, str, int]]:
-        """Per cabin, first and last observation time and tick count."""
+        """Per cabin, first sighting, last confirmation and tick count."""
         rows = self.conn.execute(
-            """SELECT cabin, MIN(observed_at) AS first, MAX(observed_at) AS last,
+            """SELECT cabin, MIN(observed_at) AS first,
+                      MAX(COALESCE(last_confirmed_at, observed_at)) AS last,
                       COUNT(*) AS n FROM observations GROUP BY cabin"""
         ).fetchall()
         return {r["cabin"]: (r["first"], r["last"], r["n"]) for r in rows}
@@ -589,12 +664,27 @@ class Store:
         )
         self.conn.commit()
 
-    def prune(self, days: int) -> int:
+    def prune(self, days: int, snapshot_days: int = 400, today: date | None = None) -> int:
+        """Keep the database bounded. Legs whose departure date has passed go.
+        Change ticks older than the retention go, except each leg's latest
+        tick, which ranking and calibration read and which keeps its first
+        sighting date. Snapshots, the dashboard's history, keep longer, they
+        are tiny. VACUUM so the file on the state branch actually shrinks."""
+        today = today or datetime.now(timezone.utc).date()
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        cur = self.conn.execute("DELETE FROM observations WHERE observed_at < ?", (cutoff,))
-        self.conn.execute("DELETE FROM snapshots WHERE at < ?", (cutoff,))
+        flown = self.conn.execute(
+            "DELETE FROM observations WHERE depart_date < ?", (today.isoformat(),)).rowcount
+        stale = self.conn.execute(
+            """DELETE FROM observations
+               WHERE COALESCE(last_confirmed_at, observed_at) < ?
+                 AND id NOT IN (SELECT MAX(id) FROM observations GROUP BY fingerprint)""",
+            (cutoff,)).rowcount
+        snap_cutoff = (datetime.now(timezone.utc) - timedelta(days=snapshot_days)).isoformat()
+        self.conn.execute("DELETE FROM snapshots WHERE at < ?", (snap_cutoff,))
         self.conn.commit()
-        return cur.rowcount
+        if flown or stale:
+            self.conn.execute("VACUUM")
+        return flown + stale
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +709,7 @@ def horizon_chunks(cfg: dict, today: date | None = None) -> list[tuple[str, str]
     return chunks
 
 
-def month_window(day: str, pad_days: int = 20) -> tuple[str, str]:
+def month_window(day: str, pad_days: int = 10) -> tuple[str, str]:
     d = datetime.strptime(day, "%Y-%m-%d").date()
     return ((d - timedelta(days=pad_days)).isoformat(),
             (d + timedelta(days=pad_days)).isoformat())
@@ -811,32 +901,46 @@ def parse_availability(obj: dict[str, Any], cabins: Iterable[str]) -> list[Leg]:
 def build_round_trips(legs: list[Leg], origins: list[str], destinations: list[str],
                       min_nights: int, max_nights: int, pairing: dict,
                       trip_key: str = "") -> list[RoundTrip]:
-    """Pair every outbound leg with every legal return leg for one trip."""
+    """Pair every outbound leg with every legal return leg for one trip.
+
+    Returns are bucketed by everything a pairing must match on (arrival
+    airport unless open jaw, program unless sources may differ, cabin unless
+    mixed cabins are allowed) and sorted by date, so each outbound only walks
+    the returns inside its night window. Four trips of a year each are tens
+    of thousands of legs, and the naive cross product took minutes."""
     out_origins, out_dests = set(origins), set(destinations)
     outbound = [l for l in legs if l.origin in out_origins and l.destination in out_dests]
     inbound = [l for l in legs if l.origin in out_dests and l.destination in out_origins]
-
-    # Bucket returns by origin airport so the inner loop stays small.
-    by_origin: dict[str, list[Leg]] = {}
-    for leg in inbound:
-        by_origin.setdefault(leg.origin, []).append(leg)
 
     same_source = pairing["require_same_source"]
     open_jaw = pairing["allow_open_jaw"]
     mixed_ok = pairing["allow_mixed_cabin"]
 
+    def bucket_key(leg: Leg, airport: str) -> tuple:
+        return (airport if not open_jaw else "",
+                leg.source if same_source else "",
+                leg.cabin if not mixed_ok else "")
+
+    buckets: dict[tuple, list[Leg]] = {}
+    for leg in inbound:
+        buckets.setdefault(bucket_key(leg, leg.origin), []).append(leg)
+    dates: dict[tuple, list[str]] = {}
+    for key, group in buckets.items():
+        group.sort(key=lambda l: l.depart_date)
+        dates[key] = [l.depart_date for l in group]
+
     pairs: list[RoundTrip] = []
     for out in outbound:
-        candidates = inbound if open_jaw else by_origin.get(out.destination, [])
-        for back in candidates:
-            if same_source and out.source != back.source:
-                continue
-            if not mixed_ok and out.cabin != back.cabin:
-                continue
-            rt = RoundTrip(out, back, trip_key)
-            if not (min_nights <= rt.nights <= max_nights):
-                continue
-            pairs.append(rt)
+        key = bucket_key(out, out.destination)
+        group = buckets.get(key)
+        if not group:
+            continue
+        day = datetime.strptime(out.depart_date, "%Y-%m-%d").date()
+        lo = (day + timedelta(days=min_nights)).isoformat()
+        hi = (day + timedelta(days=max_nights)).isoformat()
+        ds = dates[key]
+        for back in group[bisect.bisect_left(ds, lo):bisect.bisect_right(ds, hi)]:
+            pairs.append(RoundTrip(out, back, trip_key))
     return pairs
 
 
@@ -1050,7 +1154,7 @@ def fetch_window(client: SeatsAero, store: Store, cfg: dict, trip: dict,
                            (trip["destinations"], cfg["origins"])):
         res = client.cached_search(origins, dests, codes, sources, start, end)
         legs = [leg for obj in res.rows for leg in parse_availability(obj, codes)]
-        store.record_legs(legs)
+        store.record_legs(legs, cfg["storage"].get("record_unchanged", False))
         legs_total += len(legs)
         calls += res.calls
         capped = capped or res.capped
@@ -1122,10 +1226,18 @@ def prune_history(cfg: dict, store: Store) -> int:
     """Drop observations past the retention window. Runs at the end of every
     sweep and focus poll so scheduled mode, which never enters the loop,
     still keeps the database bounded."""
-    dropped = store.prune(cfg["storage"]["retain_observation_days"])
+    dropped = store.prune(cfg["storage"]["retain_observation_days"],
+                          cfg["storage"].get("retain_snapshot_days", 400))
     if dropped:
-        LOG.info("Pruned %d observations older than %d days", dropped,
-                 cfg["storage"]["retain_observation_days"])
+        LOG.info("Pruned %d observations, flown dates and change ticks older than %d days",
+                 dropped, cfg["storage"]["retain_observation_days"])
+    path = cfg["storage"]["db_path"]
+    if path != ":memory:" and os.path.exists(path):
+        size_mb = os.path.getsize(path) / 1e6
+        if size_mb > DB_SIZE_WARN_MB:
+            LOG.warning("Database is %.0f MB. GitHub refuses files over 100 MiB and the state "
+                        "branch would stop saving. Lower retain_observation_days or move state "
+                        "off git.", size_mb)
     return dropped
 
 
@@ -1167,8 +1279,9 @@ def run_focus(cfg: dict, store: Store, client: SeatsAero, dry_run: bool) -> None
         run_sweep(cfg, store, client, dry_run)
         return
     calls_total = 0
+    pad = cfg["scan"].get("focus_pad_days", 10)
     for w in windows:
-        start, end = month_window(w["date"])
+        start, end = month_window(w["date"], pad)
         _, calls, _ = fetch_window(client, store, cfg, cfg["trips"][w["trip"]], start, end)
         calls_total += calls
     LOG.info("Focus poll of %d windows done in %d calls, %d calls left",
@@ -1439,6 +1552,61 @@ def show_overview(cfg: dict, store: Store) -> None:
     print_overview(cfg, store, rank_all(cfg, legs))
 
 
+def show_calendar(cfg: dict, store: Store, trip_key: str | None, cabin: str | None,
+                  direction: str = "out") -> None:
+    """Twelve months of departure (or return) days for one trip and cabin.
+    Each cell is the cheapest viable round trip in thousands of miles per
+    person, with ? when the seats are not confirmed, a dot when a one-way leg
+    exists but nothing pairs, and blank outside the scanned horizon."""
+    trips = enabled_trips(cfg)
+    trip = next((t for t in trips if t["key"] == trip_key), trips[0]) if trip_key else trips[0]
+    if trip_key and trip["key"] != trip_key:
+        raise SystemExit(f"--trip {trip_key} is not an enabled trip. Enabled: "
+                         + ", ".join(t["key"] for t in trips))
+    code = cabin or "Y"
+    c = trip["cabins"].get(code)
+    if c is None or not c["enabled"]:
+        raise SystemExit(f"--cabin {code} is not enabled for {trip['key']}")
+    legs = store.latest_legs(cfg["alerting"]["max_data_age_hours"] * 24)
+    rows = rank_all(cfg, legs)[trip["key"]][code]
+    cal = calendar_data(cfg, trip, c, rows, legs)
+    best = {r[0]: r for r in cal[direction]}
+    oneway = {r[0] for r in cal["legs_" + direction]}
+    chunks = horizon_chunks(cfg)
+    lo, hi = chunks[0][0], chunks[-1][1]
+
+    what = "departure" if direction == "out" else "return"
+    print(f"\n{trip['label'].upper()} {c['label'].upper()}  cheapest viable round trip by {what} day, "
+          f"thousands of miles per person, party of {cfg['party_size']}")
+    print(f"? seats not confirmed   . one-way leg only, nothing pairs   blank outside {lo} to {hi}\n")
+    today = datetime.now(timezone.utc).date().replace(day=1)
+    month = today
+    for _ in range(12):
+        nxt = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+        print(f"{month.strftime('%B %Y'):20}  Mo   Tu   We   Th   Fr   Sa   Su")
+        line = " " * 22 + "     " * month.weekday()
+        d = month
+        while d < nxt:
+            iso = d.isoformat()
+            if iso < lo or iso > hi:
+                cell = "  "
+            elif iso in best:
+                cell = f"{best[iso][1] // 1000:>2}{'?' if best[iso][2] != 'confirmed' else ' '}"
+            elif iso in oneway:
+                cell = " ."
+            else:
+                cell = "  "
+            line += f"{cell:>4} "
+            if d.weekday() == 6:
+                print(line)
+                line = " " * 22
+            d += timedelta(days=1)
+        if line.strip():
+            print(line)
+        print()
+        month = nxt
+
+
 def show_stats(cfg: dict, store: Store) -> None:
     rows = store.conn.execute(
         """SELECT cabin, source, origin, destination, COUNT(*) AS n,
@@ -1584,6 +1752,41 @@ def compact_history(rows: list, now: datetime) -> list[dict]:
     return [by_day[d] for d in sorted(by_day)] + out
 
 
+def calendar_data(cfg: dict, trip: dict, c: dict, rows: list[tuple[RoundTrip, str]],
+                  legs: list[Leg]) -> dict:
+    """Per day, the cheapest viable round trip that departs that day and the
+    cheapest that returns that day, plus the cheapest one-way leg per day in
+    each direction. rows is ascending, so the first pairing seen for a date
+    is that date's cheapest. Lists of lists to keep the file small."""
+    out_best: dict[str, list] = {}
+    back_best: dict[str, list] = {}
+    for rt, _ in rows:
+        status = seat_status(rt, c["min_seats"])[0]
+        d = rt.outbound.depart_date
+        if d not in out_best:
+            out_best[d] = [d, rt.total_miles, status, rt.inbound.depart_date, rt.outbound.source]
+        d = rt.inbound.depart_date
+        if d not in back_best:
+            back_best[d] = [d, rt.total_miles, status, rt.outbound.depart_date, rt.outbound.source]
+    legs_out: dict[str, list] = {}
+    legs_back: dict[str, list] = {}
+    origins, dests = set(cfg["origins"]), set(trip["destinations"])
+    for l in legs:
+        if l.cabin != c["code"] or l.source not in c["sources"]:
+            continue
+        if l.origin in origins and l.destination in dests:
+            target = legs_out
+        elif l.origin in dests and l.destination in origins:
+            target = legs_back
+        else:
+            continue
+        cur = target.get(l.depart_date)
+        if cur is None or l.miles < cur[1]:
+            target[l.depart_date] = [l.depart_date, l.miles, l.seats, l.source]
+    return {"out": sorted(out_best.values()), "back": sorted(back_best.values()),
+            "legs_out": sorted(legs_out.values()), "legs_back": sorted(legs_back.values())}
+
+
 def dashboard_data(cfg: dict, store: Store) -> dict:
     """Everything the dashboard shows, as plain JSON. Same ranking as --best."""
     party, alert_cfg = cfg["party_size"], cfg["alerting"]
@@ -1627,6 +1830,7 @@ def dashboard_data(cfg: dict, store: Store) -> dict:
                                          if seat_status(rt, c["min_seats"])[0] != "confirmed"),
                 "best": rows[0][0].total_miles if rows else None,
                 "typical": typical, "rows": rows_out, "history": history,
+                "calendar": calendar_data(cfg, trip, c, rows, legs),
             })
         trips_out.append({
             "key": trip["key"], "label": trip["label"],
@@ -1636,8 +1840,10 @@ def dashboard_data(cfg: dict, store: Store) -> dict:
         })
 
     last_sweep = store.get_state("last_sweep")
+    chunks = horizon_chunks(cfg)
     return {
         "generated_at": now.isoformat(),
+        "horizon": {"from": chunks[0][0], "to": chunks[-1][1]},
         "party_size": party, "origins": cfg["origins"],
         "data_age_days": age_hours // 24,
         "last_sweep": last_sweep,
@@ -2003,6 +2209,10 @@ def self_test() -> None:
     mixed_pairing = dict(cfg["pairing"], allow_mixed_cabin=True)
     mixed = [p for p in build_round_trips(fresh, cfg["origins"], au["destinations"], 10, 35, mixed_pairing) if p.mixed]
     assert mixed and all(p.cabin == "Y" for p in mixed if "Y" in p.cabin_code), "mixed ranks under lower cabin"
+    brute = [RoundTrip(o, b) for o in fresh if o.origin in ("JFK", "EWR") and o.destination in ("SYD", "MEL")
+             for b in fresh if b.origin == o.destination and b.destination in ("JFK", "EWR")
+             and b.source == o.source and b.cabin == o.cabin and 10 <= RoundTrip(o, b).nights <= 35]
+    assert sorted(p.key() for p in au_pairs) == sorted(p.key() for p in brute), "bucketed pairing must equal brute force"
     print(f"pairing ok: {len(au_pairs)} same-cabin combos for Australia, {len(mixed)} mixed rejected by default")
 
     # -- ranking and seat status --------------------------------------------
@@ -2122,8 +2332,23 @@ def self_test() -> None:
     compact = compact_history(old_rows, now_dt)
     assert len(compact) == 2 and compact[0]["best"] == 69500 and compact[1]["best"] == 54000, compact
     assert data["overview"][0]["key"] == "mexico" and data["budget"]["cap"] == 900
+    cal = au_y["calendar"]
+    assert cal["out"] == [["2027-02-10", 66200, "confirmed", "2027-03-04", "delta"],
+                          ["2027-03-14", 54000, "confirmed", "2027-04-05", "delta"]], cal["out"]
+    assert cal["back"][0] == ["2027-03-04", 66200, "confirmed", "2027-02-10", "delta"]
+    assert ["2027-03-16", 20000, 2, "delta"] in cal["legs_back"], "one-way legs include the 2 seat return"
+    assert all(r[0].startswith("2027-0") for r in cal["legs_out"]) and len(cal["legs_out"]) == 2
+    mx_cal = mx_y["calendar"]
+    assert mx_cal["out"][0] == ["2027-01-10", 18000, "unpublished", "2027-01-17", "delta"]
+    assert data["horizon"]["from"] < data["horizon"]["to"]
     json.dumps(data)
-    print("export ok: dashboard data carries trips, seat status, history and the overview")
+    print("export ok: dashboard data carries trips, seat status, history, calendar and the overview")
+    out = _quiet(show_calendar, cfg, store, "australia", "Y")
+    assert "AUSTRALIA ECONOMY  cheapest viable round trip by departure day" in out
+    assert "March 2027" in out and "Mo   Tu" in out
+    out = _quiet(show_calendar, cfg, store, "mexico", "Y", "back")
+    assert "by return day" in out and "18?" in out, out
+    print("calendar ok: twelve months per trip and cabin, both directions")
 
     # -- pagination protocol ------------------------------------------------
     client = SeatsAero(cfg, store, api_key="test-key")
@@ -2173,6 +2398,47 @@ def self_test() -> None:
     assert "Mode        scheduled" in out and "= 20 windows" in out and "measured 2.60 calls" in out, out
     print(f"budget ok: scheduled plan is {plan['planned']:.0f} calls a day for 2 trips at measured pagination")
 
+    # -- a tick only when something changed -----------------------------------
+    tick = Store(":memory:")
+    old = (now_dt - timedelta(hours=20)).isoformat()
+    base = Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, old, old)
+    assert tick.record_legs([base]) == (1, 0)
+    again = Leg(**dict(asdict(base), observed_at=now, last_seen=now))
+    assert tick.record_legs([again]) == (0, 1), "same price and seats touches the latest tick"
+    assert tick.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+    assert [l.observed_at for l in tick.latest_legs(12)] == [old], "confirmed just now, so still fresh"
+    cheaper = Leg(**dict(asdict(base), miles=27000, observed_at=now, last_seen=now))
+    assert tick.record_legs([cheaper]) == (1, 0), "a price change is a new tick"
+    assert tick.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+    assert [l.miles for l in tick.latest_legs(12)] == [27000]
+    fewer = Leg(**dict(asdict(cheaper), seats=1))
+    assert tick.record_legs([fewer, fewer]) == (1, 0), "a seat change is a new tick, duplicates in a batch collapse"
+    assert tick.record_legs([fewer], record_unchanged=True) == (1, 0), "record_unchanged restores a tick per sighting"
+    assert tick.record_legs([]) == (0, 0)
+    print("ticks ok: new or changed legs are rows, unchanged legs only refresh last_confirmed_at")
+    # a database written a row per sighting collapses to one row per change
+    legacy = Store(":memory:")
+    t = [(now_dt - timedelta(hours=h)).isoformat() for h in (30, 20, 10, 5, 1)]
+    for at, miles in zip(t, (30000, 30000, 30000, 27000, 27000)):
+        legacy.record_legs([Leg(**dict(asdict(base), miles=miles, observed_at=at, last_seen=at))], record_unchanged=True)
+    legacy.record_legs([Leg(**dict(asdict(base), origin="EWR", observed_at=t[0], last_seen=t[0]))], record_unchanged=True)
+    assert legacy.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 6
+    assert legacy.collapse_repeated_ticks() == 3
+    left = legacy.conn.execute("SELECT origin, miles, observed_at, last_confirmed_at FROM observations ORDER BY id").fetchall()
+    assert [tuple(r) for r in left] == [("JFK", 30000, t[0], t[2]), ("JFK", 27000, t[3], t[4]), ("EWR", 30000, t[0], t[0])], [tuple(r) for r in left]
+    assert legacy.collapse_repeated_ticks() == 0
+    print("collapse ok: a row per sighting database shrinks to a row per change with the right stamps")
+    keep = Store(":memory:")
+    ago = lambda d: (now_dt - timedelta(days=d)).isoformat()
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 30000, 66.0, 4, "DL", False, ago(40), ago(40))])
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 29000, 66.0, 4, "DL", False, ago(30), ago(30))])
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 28000, 66.0, 4, "DL", False, ago(20), ago(20))])
+    keep.record_legs([Leg("s", "delta", "JFK", "SYD", "2026-01-01", "Y", 28000, 66.0, 4, "DL", False, now, now)])
+    assert keep.prune(14, today=date(2026, 9, 13)) == 3
+    left = keep.conn.execute("SELECT depart_date, miles FROM observations").fetchall()
+    assert [tuple(r) for r in left] == [("2027-06-01", 28000)], left
+    print("prune ok: flown dates and old change ticks go, each leg's latest tick stays whatever its age")
+
     # -- prune runs at the end of --sweep and --once --------------------------
     for label, runner in (("sweep", run_sweep), ("once", run_focus)):
         pst = Store(":memory:")
@@ -2180,15 +2446,18 @@ def self_test() -> None:
         pst.record_legs([
             Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 30000, 66.0, 4, "DL", False, stale, stale),
             Leg("s", "delta", "JFK", "SYD", "2027-03-02", "Y", 30000, 66.0, 4, "DL", False, now, now),
-        ])
+        ], record_unchanged=True)
+        pst.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-03-01", "Y", 28000, 66.0, 4, "DL", False, stale, stale)],
+                        record_unchanged=True)
         pst.set_state("focus_windows", [{"trip": "australia", "date": "2027-03-14"},
                                         {"trip": "gone", "date": "2027-03-14"}])
         pcl = SeatsAero(cfg, pst, api_key="test-key")
         pcl.session = _FakeSession([_FakeResponse({"data": [], "hasMore": False})], repeat_last=True)
         with redirect_stdout(io.StringIO()):
             runner(cfg, pst, pcl, True)
-        left = pst.conn.execute("SELECT observed_at FROM observations").fetchall()
-        assert [r[0] for r in left] == [now], f"{label} kept {left}"
+        left = pst.conn.execute("SELECT depart_date, miles, observed_at FROM observations ORDER BY id").fetchall()
+        assert [tuple(r) for r in left] == [("2027-03-02", 30000, now), ("2027-03-01", 28000, stale)], \
+            f"{label} kept {[tuple(r) for r in left]}, the old 30000 tick goes, the latest 28000 tick stays"
         assert pst.calls_today() == (40 if label == "sweep" else 2), (label, pst.calls_today())
     print("prune ok: --sweep covers every trip, --once skips windows for unknown trips, both prune")
 
@@ -2249,6 +2518,7 @@ def main() -> None:
     modes.add_argument("--probe", action="store_true", help="one live call, dump the raw response")
     modes.add_argument("--best", action="store_true", help="overview, then leaderboards per trip and cabin")
     modes.add_argument("--overview", action="store_true", help="where to go right now, one table")
+    modes.add_argument("--calendar", action="store_true", help="twelve months of days for one trip and cabin")
     modes.add_argument("--calibrate", action="store_true", help="propose thresholds from history")
     modes.add_argument("--export", metavar="FILE", help="write the dashboard data file")
     modes.add_argument("--stats", action="store_true", help="observation history summary")
@@ -2259,6 +2529,7 @@ def main() -> None:
     opts.add_argument("--trip", help="--best for one trip key only")
     opts.add_argument("--cabin", choices=CABIN_ORDER, help="--best for one cabin only")
     opts.add_argument("--limit", type=int, default=15, help="--best rows per section, default 15")
+    opts.add_argument("--returns", action="store_true", help="--calendar by return day instead of departure day")
     opts.add_argument("--dry-run", action="store_true", help="print alerts instead of sending")
     opts.add_argument("--verbose", action="store_true", help="debug logging, logs one raw row per call")
     args = ap.parse_args()
@@ -2284,6 +2555,9 @@ def main() -> None:
         return
     if args.overview:
         show_overview(cfg, store)
+        return
+    if args.calendar:
+        show_calendar(cfg, store, args.trip, args.cabin, "back" if args.returns else "out")
         return
     if args.calibrate:
         show_calibrate(cfg, store)

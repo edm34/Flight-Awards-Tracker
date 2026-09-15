@@ -22,7 +22,9 @@ horizon:
   # Airlines load schedules roughly 331 days out. Start far enough forward
   # that award inventory exists. Lower min_days_out for a last-minute deal.
   min_days_out: 45
-  max_days_out: 331
+  # 360 so the calendar view reaches twelve months out. Most programs load
+  # inventory 331 to 355 days ahead, the last window is often thin.
+  max_days_out: 360
   # Each API call covers this many days for one trip. Smaller means more
   # calls but less pagination per call. --budget shows the measured figure.
   chunk_days: 31
@@ -34,13 +36,18 @@ scan:
   #            branch between runs
   mode: scheduled
   # Scheduled mode only. Mirror the crons in .github/workflows. focus-poll.yml
-  # runs at :07 and :37, full-sweep.yml runs four times a day.
-  polls_per_day: 48
-  sweeps_per_day: 4
+  # runs hourly at :07, full-sweep.yml runs three times a day at :17.
+  # Europe alone returns four thousand legs a window and needs seven calls
+  # where the other trips need two, so half-hourly polling did not fit.
+  polls_per_day: 24
+  sweeps_per_day: 3
   # Focus windows go to every trip's economy top date first, then every
   # trip's premium top, and so on, then fill by global rank. One per trip
   # and month. Four trips need at least four windows.
   max_focus_windows: 4
+  # A focus window covers this many days either side of the date it targets.
+  # Smaller means fewer rows and fewer pages per poll.
+  focus_pad_days: 10
   # Loop mode only.
   sweep_interval_hours: 6
   focus_interval_minutes: 15
@@ -151,4 +158,17 @@ pushover:
 
 storage:
   db_path: "award_monitor.sqlite3"
-  retain_observation_days: 400
+  # Change ticks older than this are dropped, except each leg's latest tick,
+  # which stays until its departure date passes. Ranking and calibration read
+  # the latest tick per leg, so nothing they need is lost. At four trips the
+  # database is eighty thousand live legs and lives on a git branch that
+  # refuses files over 100 MiB, so keep this short.
+  retain_observation_days: 14
+  # The dashboard's price history, one small row per trip and cabin per run.
+  retain_snapshot_days: 400
+  # A leg gets a new row when it is new or when its price, taxes, seats,
+  # airlines or routing changed. An unchanged leg only refreshes its
+  # last_confirmed_at. Every change is still a row, so the price history is
+  # complete. True writes a row per sighting, which at four trips is eighty
+  # thousand rows a sweep on a database that lives on a git branch.
+  record_unchanged: false

@@ -9,7 +9,7 @@ live dashboard. See @README.md for setup and operating instructions.
 
 Beat 66,200 miles per person round trip in economy. That is what Eric paid in
 April 2026, not the 60,000 he remembers. Source is the Delta award receipt,
-confirmation GYLTUY, ticket 0062378205056, issued 6 Nov 2025.
+issued 6 Nov 2025. The confirmation and ticket numbers stay off this public repo.
 
 - 66,200 miles plus $132.53 per person, 264,800 miles for four
 - Out Wed 25 Mar 2026, DL771 JFK-LAX, DL41 LAX-SYD
@@ -53,7 +53,8 @@ dashboard export, calibration, self test, main.
   `--overview`, `--best` and the dashboard. `Store.typical_best` is the
   median of three weeks of snapshots, null under fourteen days.
 - `dashboard_data` and `--export` write the JSON the dashboard reads.
-  `compact_history` keeps the file small.
+  `compact_history` keeps the file small. `calendar_data` is the per-day
+  layer, shared by `--calendar` and the dashboard grid.
 - `budget_plan` prices a window as one trip and one date range, two
   directions, times the measured pagination.
 - `scan.mode` is `loop` or `scheduled`. Scheduled mode is GitHub Actions on
@@ -110,8 +111,10 @@ constant and the self test asserts it appears.
 
 **API budget is 1,000 calls a day, hard.** Run `--budget` after any change to
 `horizon`, `scan`, `cabins` or `trips`. Adding a cabin adds no calls but adds
-rows, which adds pages. Adding a trip adds a full set of calls. Four trips
-plan at 704 of 900 before pagination. Every sweep measures calls per window and `--budget`
+rows, which adds pages. Adding a trip adds a full set of calls. Europe returns
+four thousand legs a window and needs seven calls where the others need
+two, so polls are hourly and sweeps three a day. Four trips plan at 741 of
+900 at the measured 3.25 calls per window. Every sweep measures calls per window and `--budget`
 multiplies by that. If it climbs past about 2.5, lower `chunk_days` or raise
 `focus_interval_minutes`. `budget_safety_margin` exists so a manual `--once`
 never trips the cap.
@@ -127,8 +130,20 @@ seats.aero's crawl, not the poll interval. Do not add a live search call path.
   `self_test()` instead. `--probe` is the one sanctioned live diagnostic and
   it costs one call.
 - No new dependencies beyond `requests` and `pyyaml` without asking.
-- SQLite keeps every observation as a tick rather than upserting. The price
-  history is what makes `--calibrate` possible. Do not switch to upsert.
+- SQLite keeps a tick for every change. A leg that is new or whose price,
+  taxes, seats, airlines or routing changed gets a row. An unchanged leg
+  only refreshes `last_confirmed_at` on its latest tick. The price history
+  is complete, every change is a row, and freshness reads from
+  `last_confirmed_at`. Don't switch to an upsert that overwrites price, and
+  don't go back to a row per sighting without `storage.record_unchanged`,
+  four trips are eighty thousand legs a sweep on a database that lives on a
+  git branch.
+- The database is force-pushed to `monitor-state` every run and GitHub
+  refuses a file over 100 MiB. It hit that on 13 Sep 2026 after two days of
+  a row per sighting. `prune` drops flown departure dates and change ticks
+  older than `retain_observation_days` while always keeping each leg's
+  latest tick, then runs `VACUUM`. `prune_history` warns past 70 MB. If it
+  ever grows past that, move state to a release asset.
 - Thresholds are never written to `config.yaml` by code. `--calibrate` prints
   a block to paste.
 
