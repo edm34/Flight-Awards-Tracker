@@ -1,7 +1,7 @@
 # Award Monitor
 
 Personal tool. Monitors seats.aero for award redemptions for a family of four
-from the New York area to Australia, Mexico, Europe and Asia. Ranks the whole
+from the New York area to Australia, Mexico City, Baja, Europe and Asia. Ranks the whole
 bookable calendar by miles per trip and cabin, alerts on Pushover, feeds a
 live dashboard. See @README.md for setup and operating instructions.
 
@@ -113,8 +113,8 @@ constant and the self test asserts it appears.
 `horizon`, `scan`, `cabins` or `trips`. Adding a cabin adds no calls but adds
 rows, which adds pages. Adding a trip adds a full set of calls. Europe returns
 four thousand legs a window and needs seven calls where the others need
-two, so polls are hourly and sweeps three a day. Four trips plan at 741 of
-900 at the measured 3.25 calls per window. Every sweep measures calls per window and `--budget`
+two, so polls are hourly and sweeps twice a day. Five trips plan at about
+750 of 900 at the measured 3.62 calls per window. Every sweep measures calls per window and `--budget`
 multiplies by that. If it climbs past about 2.5, lower `chunk_days` or raise
 `focus_interval_minutes`. `budget_safety_margin` exists so a manual `--once`
 never trips the cap.

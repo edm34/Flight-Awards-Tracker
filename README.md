@@ -61,10 +61,10 @@ trips:
     max_trip_nights: 35
     cabins:
       Y: {benchmark_miles: 66200, floor_miles: 60000, ceiling_miles: 72000}
-  mexico:
-    destinations: [MEX, SJD, LAP]
-    min_trip_nights: 5
-    max_trip_nights: 14
+  baja:
+    destinations: [SJD, LAP]
+    min_trip_nights: 7
+    max_trip_nights: 21
 ```
 
 Cabin defaults, the programs to query, tax caps, seat rules and Pushover
@@ -223,17 +223,17 @@ at 3am while a business observation waits until morning.
 Two modes share one budget.
 
 **Sweep** walks the full horizon in 31 day windows, every trip, both
-directions. Eleven date ranges times four trips is 44 windows, three times a
+directions. Eleven date ranges times five trips is 55 windows, twice a
 day. Europe returns about four thousand legs a window and needs seven calls
-where the other trips need two, so a sweep is about 143 calls.
+where the other trips need two, so a sweep is about 165 calls.
 
 **Focus** re-polls `focus_pad_days` either side of the best dates. Every
 trip's economy top first, then every trip's premium top, and so on, capped
 at `max_focus_windows`, hourly on the schedule.
 
 Every sweep records how many calls each window actually took and `--budget`
-multiplies the plan by that measured figure. Four trips plan at 741 of 900
-usable calls a day at the measured 3.25 calls per window.
+multiplies the plan by that measured figure. Five trips plan at about 750 of
+900 usable calls a day at the measured 3.62 calls per window.
 
 ## Hosting on GitHub Actions
 
@@ -242,7 +242,7 @@ usable calls a day at the measured 3.25 calls per window.
 
 - `probe.yml` is manual. One live call, prints the reconciliation table.
 - `focus-poll.yml` runs `--once` hourly at :07.
-- `full-sweep.yml` runs `--sweep` at :17 every eight hours.
+- `full-sweep.yml` runs `--sweep` at :17 every twelve hours.
 
 The database and `dashboard.json` live on an orphan branch called
 `monitor-state`. A leg gets a new row only when it is new or something about
