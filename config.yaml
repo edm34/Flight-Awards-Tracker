@@ -36,11 +36,13 @@ scan:
   #            branch between runs
   mode: scheduled
   # Scheduled mode only. Mirror the crons in .github/workflows. focus-poll.yml
-  # runs hourly at :07, full-sweep.yml runs three times a day at :17.
+  # runs hourly at :07, full-sweep.yml runs twice a day at :17.
   # Europe alone returns four thousand legs a window and needs seven calls
-  # where the other trips need two, so half-hourly polling did not fit.
+  # where the other trips need two, and five trips are 55 windows a sweep,
+  # so two sweeps a day is what fits. The hourly polls keep the best months
+  # fresh between them.
   polls_per_day: 24
-  sweeps_per_day: 3
+  sweeps_per_day: 2
   # Focus windows go to every trip's economy top date first, then every
   # trip's premium top, and so on, then fill by global rank. One per trip
   # and month. Four trips need at least four windows.
@@ -111,8 +113,8 @@ trips:
   australia:
     label: "Australia"
     destinations: [SYD, MEL, BNE]
-    min_trip_nights: 10
-    max_trip_nights: 35
+    min_trip_nights: 18
+    max_trip_nights: 25
     cabins:
       Y:
         benchmark_miles: 66200    # verified, April 2026 receipt
@@ -120,10 +122,15 @@ trips:
         ceiling_miles: 72000
       # W, J and F observe-only until --calibrate has history.
   mexico:
-    label: "Mexico"
-    destinations: [MEX, SJD, LAP]
+    label: "Mexico City"
+    destinations: [MEX]
     min_trip_nights: 5
     max_trip_nights: 14
+  baja:
+    label: "Baja"
+    destinations: [SJD, LAP]
+    min_trip_nights: 7
+    max_trip_nights: 21
   europe:
     label: "Europe"
     destinations: [CDG, MXP, GVA]
