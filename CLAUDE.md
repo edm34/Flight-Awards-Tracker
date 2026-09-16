@@ -39,8 +39,9 @@ dashboard export, calibration, self test, main.
   lists. `evaluate`, `show_best`, `calibrate` and `dashboard_data` all go
   through it so nothing can drift apart.
 - `seat_status` is the one reading of a seat count. confirmed, unpublished
-  or short. Unpublished rows are kept and flagged everywhere, never trusted.
-  Short rows are dropped.
+  or short. Unpublished rows are kept and flagged everywhere, never trusted,
+  and never alerted unless `alerting.alert_unconfirmed_seats` is set. Short
+  rows are dropped.
 - `evaluate` walks each trip's each cabin's list ascending with a running
   best stored as `best_total_miles:<trip>:<cabin>`, collects every
   qualifying pairing and sends one digest through `format_digest`. The first

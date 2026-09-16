@@ -337,6 +337,7 @@ def validate_config(raw: dict | None, source: str = "config") -> dict:
     alerting = cfg["alerting"]
     alerting.setdefault("max_data_age_hours", 12)
     alerting.setdefault("require_seat_count", False)
+    alerting.setdefault("alert_unconfirmed_seats", False)
     alerting.setdefault("improvement_threshold_miles", 0)
     alerting.setdefault("cooldown_hours", 6)
 
@@ -1181,18 +1182,30 @@ def evaluate(cfg: dict, store: Store, dry_run: bool) -> Ranked:
                                   len(rows), unconfirmed)
             if not rows:
                 continue
+            # Seats are required for an alert, not for the leaderboard. A
+            # pairing whose program publishes no count stays ranked and
+            # flagged everywhere, but it does not wake anyone up unless
+            # alert_unconfirmed_seats is set. The first live week sent a
+            # priority 1 push for twenty American dates nobody could confirm.
+            if alert_cfg["alert_unconfirmed_seats"]:
+                alertable = rows
+            else:
+                alertable = [(rt, note) for rt, note in rows
+                             if seat_status(rt, ccfg["min_seats"])[0] == "confirmed"]
+            if not alertable:
+                continue
             state_key = f"best_total_miles:{trip_key}:{code}"
             prev_best = store.get_state(state_key)
-            best_rt = rows[0][0]
+            best_rt = alertable[0][0]
 
-            # rows is ascending, so walk it with a running best. Without this
-            # every combination compares against the same stale figure and a
-            # cold start alerts on the whole leaderboard instead of just the
+            # alertable is ascending, so walk it with a running best. Without
+            # this every combination compares against the same stale figure and
+            # a cold start alerts on the whole leaderboard instead of just the
             # winner. The best is per trip and cabin so a cheap economy pairing
             # never suppresses business, and Mexico never suppresses Sydney.
             running_best = prev_best
             hits: list[tuple[RoundTrip, str, str]] = []
-            for rt, note in rows[:ALERT_SCAN_DEPTH]:
+            for rt, note in alertable[:ALERT_SCAN_DEPTH]:
                 reason = alert_reason(rt, running_best, ccfg)
                 if not reason or not should_alert(rt, store, alert_cfg):
                     continue
@@ -2071,6 +2084,12 @@ class _FakeSession:
         return self.pages.pop(0)
 
 
+def _fresh_store(raw: list[dict]) -> "Store":
+    st = Store(":memory:")
+    st.record_legs([leg for obj in raw for leg in parse_availability(obj, CABIN_ORDER)])
+    return st
+
+
 def _expect_fail(fn, needle: str) -> None:
     try:
         fn()
@@ -2256,15 +2275,15 @@ def self_test() -> None:
     out = _quiet(evaluate, cfg, store, True)
     assert "54k AUSTRALIA ECONOMY DELTA JFK-SYD" in out, out
     assert "285k AUSTRALIA BUSINESS DELTA JFK-SYD" in out, "cheap economy suppressed the business alert"
-    assert "18k MEXICO ECONOMY DELTA JFK-MEX, seats unconfirmed\n" in out, out
-    assert "25k MEXICO" not in out, "25,000 is above the floor and not a new best"
+    assert "18k MEXICO" not in out, "unconfirmed seats must not alert by default"
+    assert "25k MEXICO ECONOMY DELTA JFK-SJD\n" in out, "the confirmed pairing is the one that alerts"
     assert "PREMIUM ECONOMY" not in out and "FIRST" not in out, "observe-only cabins alerted"
     assert out.count("WOULD ALERT") == 3, out
     assert "vs economy benchmark 66,200: saves 12,200" in out
     assert store.get_state("best_total_miles:australia:Y") == 54000
     assert store.get_state("best_total_miles:australia:J") == 285000
     assert store.get_state("best_total_miles:australia:W") == 140000, "observe-only cabins still track a best"
-    assert store.get_state("best_total_miles:mexico:Y") == 18000
+    assert store.get_state("best_total_miles:mexico:Y") == 25000, "best for alerting is the confirmed best"
     focus = store.get_state("focus_windows")
     assert focus == [{"trip": "australia", "date": "2027-03-14"}, {"trip": "mexico", "date": "2027-01-10"},
                      {"trip": "australia", "date": "2027-06-01"}], focus
@@ -2275,7 +2294,11 @@ def self_test() -> None:
         ("mexico", "F", None, 0, 0), ("mexico", "J", None, 0, 0),
         ("mexico", "W", None, 0, 0), ("mexico", "Y", 18000, 2, 1)], [tuple(r) for r in snaps]
     assert "WOULD ALERT" not in _quiet(evaluate, cfg, store, True), "alerts repeated on the second pass"
-    print(f"evaluate ok: three trips and cabins alert independently, snapshots recorded, second pass silent")
+    loose = copy.deepcopy(cfg)
+    loose["alerting"]["alert_unconfirmed_seats"] = True
+    out = _quiet(evaluate, loose, Store(":memory:") if False else _fresh_store(raw), True)
+    assert "18k MEXICO ECONOMY DELTA JFK-MEX, seats unconfirmed" in out, "opt in restores unconfirmed alerts"
+    print(f"evaluate ok: three lists alert independently, unconfirmed seats only alert on opt in, second pass silent")
 
     # -- a burst of qualifying pairings is one message ------------------------
     burst = Store(":memory:")

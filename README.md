@@ -91,9 +91,11 @@ as a yes.
 
 - A row whose count is published and at least `min_seats` is confirmed.
 - A row whose program publishes no count is kept, shown as `?` in every table,
-  counted in every section footer, and its alert title ends in
+  counted in every section footer, and given an amber pill on the dashboard.
+  It never alerts. Seats are required for a push, not for the leaderboard.
+  `alerting.alert_unconfirmed_seats: true` restores those alerts, titled
   `seats unconfirmed` with a line in the body saying the four seats are not
-  confirmed. The dashboard shows an amber pill.
+  confirmed.
 - A row whose published count is below `min_seats` is dropped. It can't be
   booked for the party.
 
@@ -203,10 +205,11 @@ Price gates live per trip and cabin, plumbing lives under `alerting`.
   beats the standing best by that much.
 - `ceiling_miles` suppresses everything worse, however good the trend.
 
-Each trip and cabin sorts ascending and walks with its own running best,
-stored as `best_total_miles:<trip>:<cabin>`, so a cold start alerts on each
-list's winner and a cheap Mexico economy pairing can't suppress a Sydney
-business one.
+Each trip and cabin sorts ascending, keeps only the pairings with confirmed
+seats, and walks them with its own running best, stored as
+`best_total_miles:<trip>:<cabin>`, so a cold start alerts on each list's
+winner and a cheap Mexico economy pairing can't suppress a Sydney business
+one.
 
 Each list sends at most one message per pass. The cheapest qualifying pairing
 is written out in full and every other qualifying pairing gets one line, so
