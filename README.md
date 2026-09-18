@@ -61,10 +61,10 @@ trips:
     max_trip_nights: 35
     cabins:
       Y: {benchmark_miles: 66200, floor_miles: 60000, ceiling_miles: 72000}
-  mexico:
-    destinations: [MEX, SJD, LAP]
-    min_trip_nights: 5
-    max_trip_nights: 14
+  baja:
+    destinations: [SJD, LAP]
+    min_trip_nights: 7
+    max_trip_nights: 21
 ```
 
 Cabin defaults, the programs to query, tax caps, seat rules and Pushover
@@ -91,9 +91,11 @@ as a yes.
 
 - A row whose count is published and at least `min_seats` is confirmed.
 - A row whose program publishes no count is kept, shown as `?` in every table,
-  counted in every section footer, and its alert title ends in
+  counted in every section footer, and given an amber pill on the dashboard.
+  It never alerts. Seats are required for a push, not for the leaderboard.
+  `alerting.alert_unconfirmed_seats: true` restores those alerts, titled
   `seats unconfirmed` with a line in the body saying the four seats are not
-  confirmed. The dashboard shows an amber pill.
+  confirmed.
 - A row whose published count is below `min_seats` is dropped. It can't be
   booked for the party.
 
@@ -203,10 +205,11 @@ Price gates live per trip and cabin, plumbing lives under `alerting`.
   beats the standing best by that much.
 - `ceiling_miles` suppresses everything worse, however good the trend.
 
-Each trip and cabin sorts ascending and walks with its own running best,
-stored as `best_total_miles:<trip>:<cabin>`, so a cold start alerts on each
-list's winner and a cheap Mexico economy pairing can't suppress a Sydney
-business one.
+Each trip and cabin sorts ascending, keeps only the pairings with confirmed
+seats, and walks them with its own running best, stored as
+`best_total_miles:<trip>:<cabin>`, so a cold start alerts on each list's
+winner and a cheap Mexico economy pairing can't suppress a Sydney business
+one.
 
 Each list sends at most one message per pass. The cheapest qualifying pairing
 is written out in full and every other qualifying pairing gets one line, so
@@ -223,17 +226,17 @@ at 3am while a business observation waits until morning.
 Two modes share one budget.
 
 **Sweep** walks the full horizon in 31 day windows, every trip, both
-directions. Eleven date ranges times four trips is 44 windows, three times a
+directions. Eleven date ranges times five trips is 55 windows, twice a
 day. Europe returns about four thousand legs a window and needs seven calls
-where the other trips need two, so a sweep is about 143 calls.
+where the other trips need two, so a sweep is about 165 calls.
 
 **Focus** re-polls `focus_pad_days` either side of the best dates. Every
 trip's economy top first, then every trip's premium top, and so on, capped
 at `max_focus_windows`, hourly on the schedule.
 
 Every sweep records how many calls each window actually took and `--budget`
-multiplies the plan by that measured figure. Four trips plan at 741 of 900
-usable calls a day at the measured 3.25 calls per window.
+multiplies the plan by that measured figure. Five trips plan at about 750 of
+900 usable calls a day at the measured 3.62 calls per window.
 
 ## Hosting on GitHub Actions
 
@@ -242,7 +245,7 @@ usable calls a day at the measured 3.25 calls per window.
 
 - `probe.yml` is manual. One live call, prints the reconciliation table.
 - `focus-poll.yml` runs `--once` hourly at :07.
-- `full-sweep.yml` runs `--sweep` at :17 every eight hours.
+- `full-sweep.yml` runs `--sweep` at :17 every twelve hours.
 
 The database and `dashboard.json` live on an orphan branch called
 `monitor-state`. A leg gets a new row only when it is new or something about
