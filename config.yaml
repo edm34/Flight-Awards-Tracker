@@ -175,7 +175,12 @@ storage:
   # the latest tick per leg, so nothing they need is lost. At four trips the
   # database is eighty thousand live legs and lives on a git branch that
   # refuses files over 100 MiB, so keep this short.
-  retain_observation_days: 14
+  retain_observation_days: 7
+  # Hard cap on the database file. Past it the oldest change ticks go until
+  # it fits, each leg's latest tick always stays. The file is gzipped on the
+  # state branch, so this is about runner time and git history, not the
+  # 100 MiB limit that stopped saves twice in September 2026.
+  max_db_mb: 60
   # The dashboard's price history, one small row per trip and cabin per run.
   retain_snapshot_days: 400
   # A leg gets a new row when it is new or when its price, taxes, seats,

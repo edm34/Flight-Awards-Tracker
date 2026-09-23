@@ -247,7 +247,7 @@ multiplies the plan by that measured figure. Five trips plan at about 750 of
 - `focus-poll.yml` runs `--once` hourly at :07.
 - `full-sweep.yml` runs `--sweep` at :17 every twelve hours.
 
-The database and `dashboard.json` live on an orphan branch called
+The database, gzipped, and `dashboard.json` live on an orphan branch called
 `monitor-state`. A leg gets a new row only when it is new or something about
 it changed, and an unchanged leg refreshes its `last_confirmed_at`, so the
 history stays complete without eighty thousand duplicate rows a sweep. Each run restores them, works, then force-pushes them back. A
@@ -255,7 +255,8 @@ run refuses to start on a blank database if that branch exists but can't be
 read. Both scheduled workflows share one concurrency group, and a separate job
 sends a Pushover message if a run fails or times out. Every run prunes
 flown departure dates and change ticks past `storage.retain_observation_days`
-on its way out, keeping each leg's latest tick, and
+on its way out, keeping each leg's latest tick, then trims the oldest change
+ticks until the file is under `storage.max_db_mb`, and
 `--best` fences its output in a code block under Actions so the job summary
 keeps its columns.
 
