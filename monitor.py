@@ -85,8 +85,9 @@ ALERT_SCAN_DEPTH = 20
 DIGEST_ROWS = 6
 
 # The state database is force-pushed to a git branch. GitHub refuses a file
-# over 100 MiB, and the save step failed on exactly that once. Warn early.
-DB_SIZE_WARN_MB = 70
+# over 100 MiB and the save step failed on exactly that twice, so the monitor
+# enforces its own cap. storage.max_db_mb overrides.
+DB_MAX_MB = 60
 
 # Rows per trip and cabin written to the dashboard file.
 DASHBOARD_ROWS = 15
@@ -404,9 +405,7 @@ CREATE TABLE IF NOT EXISTS observations (
     observed_at TEXT NOT NULL,
     last_confirmed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_obs_fp ON observations(fingerprint, observed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_obs_date ON observations(depart_date, miles);
-CREATE INDEX IF NOT EXISTS idx_obs_cabin ON observations(cabin, observed_at);
+CREATE INDEX IF NOT EXISTS idx_obs_fp ON observations(fingerprint, id);
 
 CREATE TABLE IF NOT EXISTS alerts (
     key TEXT PRIMARY KEY,
@@ -470,6 +469,12 @@ class Store:
             dropped = self.collapse_repeated_ticks()
             if dropped:
                 LOG.info("Collapsed %d repeated ticks into their first sighting", dropped)
+        # Two indexes nothing read, together a third of the file on the state
+        # branch. The one on (fingerprint, id) serves every latest-tick join.
+        for old in ("idx_obs_date", "idx_obs_cabin"):
+            self.conn.execute(f"DROP INDEX IF EXISTS {old}")
+        self.conn.execute("DROP INDEX IF EXISTS idx_obs_fp")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_fp ON observations(fingerprint, id)")
 
     def collapse_repeated_ticks(self) -> int:
         """One-time repair for a database written a row per sighting. Runs of
@@ -665,6 +670,40 @@ class Store:
         )
         self.conn.commit()
 
+    def size_mb(self) -> float | None:
+        row = self.conn.execute("PRAGMA database_list").fetchone()
+        path = row[2] if row else ""
+        if not path or not os.path.exists(path):
+            return None
+        return os.path.getsize(path) / 1e6
+
+    def trim_to_size(self, max_mb: float) -> int:
+        """Hard cap on the file. Drops the oldest change ticks, never a leg's
+        latest tick, in chunks sized to the excess with a VACUUM between,
+        until the file fits. Ranking and calibration read the latest tick per
+        leg, so what goes is only older price history. Returns rows dropped."""
+        dropped = 0
+        for _ in range(12):
+            size = self.size_mb()
+            if size is None or size <= max_mb:
+                break
+            old = self.conn.execute(
+                """SELECT COUNT(*) FROM observations
+                   WHERE id NOT IN (SELECT MAX(id) FROM observations GROUP BY fingerprint)"""
+            ).fetchone()[0]
+            if old == 0:
+                break
+            chunk = max(1, old // 10, int(old * (1 - max_mb / size)))
+            cur = self.conn.execute(
+                """DELETE FROM observations WHERE id IN (
+                     SELECT id FROM observations
+                     WHERE id NOT IN (SELECT MAX(id) FROM observations GROUP BY fingerprint)
+                     ORDER BY id LIMIT ?)""", (chunk,))
+            dropped += cur.rowcount
+            self.conn.commit()
+            self.conn.execute("VACUUM")
+        return dropped
+
     def prune(self, days: int, snapshot_days: int = 400, today: date | None = None) -> int:
         """Keep the database bounded. Legs whose departure date has passed go.
         Change ticks older than the retention go, except each leg's latest
@@ -683,8 +722,7 @@ class Store:
         snap_cutoff = (datetime.now(timezone.utc) - timedelta(days=snapshot_days)).isoformat()
         self.conn.execute("DELETE FROM snapshots WHERE at < ?", (snap_cutoff,))
         self.conn.commit()
-        if flown or stale:
-            self.conn.execute("VACUUM")
+        self.conn.execute("VACUUM")
         return flown + stale
 
 
@@ -1244,13 +1282,14 @@ def prune_history(cfg: dict, store: Store) -> int:
     if dropped:
         LOG.info("Pruned %d observations, flown dates and change ticks older than %d days",
                  dropped, cfg["storage"]["retain_observation_days"])
-    path = cfg["storage"]["db_path"]
-    if path != ":memory:" and os.path.exists(path):
-        size_mb = os.path.getsize(path) / 1e6
-        if size_mb > DB_SIZE_WARN_MB:
-            LOG.warning("Database is %.0f MB. GitHub refuses files over 100 MiB and the state "
-                        "branch would stop saving. Lower retain_observation_days or move state "
-                        "off git.", size_mb)
+    cap = cfg["storage"].get("max_db_mb", DB_MAX_MB)
+    before = store.size_mb()
+    if before is not None and before > cap:
+        trimmed = store.trim_to_size(cap)
+        LOG.warning("Database was %.0f MB, over the %d MB cap. Dropped %d old change ticks, "
+                    "now %.0f MB. Lower retain_observation_days if this keeps happening.",
+                    before, cap, trimmed, store.size_mb() or 0)
+        dropped += trimmed
     return dropped
 
 
@@ -2461,6 +2500,24 @@ def self_test() -> None:
     left = keep.conn.execute("SELECT depart_date, miles FROM observations").fetchall()
     assert [tuple(r) for r in left] == [("2027-06-01", 28000)], left
     print("prune ok: flown dates and old change ticks go, each leg's latest tick stays whatever its age")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        big = Store(os.path.join(tmp, "cap.sqlite3"))
+        for i in range(3000):
+            big.record_legs([Leg("s", "delta", "JFK", "SYD", "2027-06-01", "Y", 30000 + i, 66.0, 4,
+                                 "DL", False, ago(2), ago(2))])   # 3000 price changes on one leg
+        big.record_legs([Leg("s", "delta", "JFK", "MEL", "2027-06-01", "Y", 30000, 66.0, 4, "DL", False, now, now)])
+        start = big.size_mb()
+        assert start > 0.2, start
+        cap = start / 2
+        dropped = big.trim_to_size(cap)
+        assert dropped > 0 and big.size_mb() <= cap, (dropped, big.size_mb(), cap)
+        left = big.conn.execute("SELECT destination, miles FROM observations ORDER BY id").fetchall()
+        assert ("MEL", 30000) in [tuple(r) for r in left] and left[-2][1] == 32999, "latest tick per leg survives"
+        assert big.trim_to_size(cap) == 0
+        idx = {r[1] for r in big.conn.execute("PRAGMA index_list(observations)")}
+        assert idx == {"idx_obs_fp"}, idx
+    print("cap ok: the file is trimmed to size by dropping the oldest change ticks, latest ticks survive")
 
     # -- prune runs at the end of --sweep and --once --------------------------
     for label, runner in (("sweep", run_sweep), ("once", run_focus)):

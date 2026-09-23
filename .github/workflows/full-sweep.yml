@@ -38,7 +38,11 @@ jobs:
           git ls-remote --exit-code --heads origin monitor-state >/dev/null || rc=$?
           if [ "$rc" -eq 0 ]; then
             git fetch --depth=1 origin monitor-state
-            git show FETCH_HEAD:award_monitor.sqlite3 > award_monitor.sqlite3
+            if git cat-file -e FETCH_HEAD:award_monitor.sqlite3.gz 2>/dev/null; then
+              git show FETCH_HEAD:award_monitor.sqlite3.gz | gunzip > award_monitor.sqlite3
+            else
+              git show FETCH_HEAD:award_monitor.sqlite3 > award_monitor.sqlite3
+            fi
             echo "restored award_monitor.sqlite3 ($(stat -c%s award_monitor.sqlite3) bytes)"
           elif [ "$rc" -eq 2 ]; then
             echo "no monitor-state branch yet, starting fresh"
@@ -83,7 +87,10 @@ jobs:
           git config user.email "award-monitor@users.noreply.github.com"
           git checkout --orphan tmp-state
           git rm -rf --cached . >/dev/null 2>&1 || true
-          git add -f award_monitor.sqlite3
+          # Gzipped, a SQLite file shrinks five to ten times, well clear of
+          # GitHub's 100 MiB limit that rejected two saves in September 2026.
+          gzip -9 -c award_monitor.sqlite3 > award_monitor.sqlite3.gz
+          git add -f award_monitor.sqlite3.gz
           [ -f dashboard.json ] && git add -f dashboard.json || true
           git commit -m "state $(date -u +%FT%TZ)" >/dev/null
           git push -f origin tmp-state:monitor-state
